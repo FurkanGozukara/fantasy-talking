@@ -10,9 +10,6 @@
 * 2025年4月28日: 开源了音频条件下的推理代码和模型权重。
 
 
-<!-- ![Fig.1](https://github.com/Fantasy-AMAP/fantasy-talking/blob/main/assert/fig0_1_0.png) -->
-
-
 ## 快速开始
 ### 🛠️安装和依赖
 

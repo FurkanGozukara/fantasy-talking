@@ -10,9 +10,6 @@
 * April 28, 2025: We released the inference code and model weights for audio conditions.
 
 
-<!-- ![Fig.1](https://github.com/Fantasy-AMAP/fantasy-talking/blob/main/assert/fig0_1_0.png) -->
-
-
 ## Quickstart
 ### 🛠️Installation
 
