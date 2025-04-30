@@ -8,4 +8,5 @@ python infer.py \
     --prompt_cfg_scale 5.0 \
     --audio_cfg_scale 5.0 \
     --fps 23 \
+    --num_persistent_param_in_dit 7000000000 \
     --seed 1111

@@ -1,0 +1,13 @@
+.vs/
+__pycache__/
+diffsynth/__pycache__/
+diffsynth/configs/__pycache__/
+diffsynth/data/__pycache__/
+diffsynth/models/__pycache__/
+diffsynth/pipelines/__pycache__/
+diffsynth/prompters/__pycache__/
+diffsynth/schedulers/__pycache__/
+diffsynth/vram_management/__pycache__/
+models/
+output/
+venv/

@@ -23,7 +23,7 @@ def parse_args():
     parser.add_argument(
         "--wan_model_dir",
         type=str,
-        default="./models/Wan2.1-I2V-14B-720P",
+        default="./models",
         required=False,
         help="The dir of the Wan I2V 14B model.",
     )
@@ -112,7 +112,7 @@ def parse_args():
     parser.add_argument(
         "--num_persistent_param_in_dit",
         type=int,
-        default=None,
+        default=5000000000,
         required=False,
         help="Maximum parameter quantity retained in video memory, small number to reduce VRAM required",
     )
@@ -131,15 +131,7 @@ def load_models(args):
     model_manager = ModelManager(device="cpu")
     model_manager.load_models(
         [
-            [
-                f"{args.wan_model_dir}/diffusion_pytorch_model-00001-of-00007.safetensors",
-                f"{args.wan_model_dir}/diffusion_pytorch_model-00002-of-00007.safetensors",
-                f"{args.wan_model_dir}/diffusion_pytorch_model-00003-of-00007.safetensors",
-                f"{args.wan_model_dir}/diffusion_pytorch_model-00004-of-00007.safetensors",
-                f"{args.wan_model_dir}/diffusion_pytorch_model-00005-of-00007.safetensors",
-                f"{args.wan_model_dir}/diffusion_pytorch_model-00006-of-00007.safetensors",
-                f"{args.wan_model_dir}/diffusion_pytorch_model-00007-of-00007.safetensors",
-            ],
+            f"{args.wan_model_dir}/wan21_i2v_720p_14B_fp16.safetensors",
             f"{args.wan_model_dir}/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
             f"{args.wan_model_dir}/models_t5_umt5-xxl-enc-bf16.pth",
             f"{args.wan_model_dir}/Wan2.1_VAE.pth",

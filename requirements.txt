@@ -1,5 +1,4 @@
-torch>=2.0.0
-torchvision
+gradio
 cupy-cuda12x
 transformers==4.46.2
 controlnet-aux==0.0.7
