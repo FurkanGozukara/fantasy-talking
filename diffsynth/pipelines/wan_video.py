@@ -1,3 +1,5 @@
+# --- START OF FILE wan_video.py ---
+
 import os
 
 import numpy as np
@@ -19,6 +21,12 @@ from ..vram_management import (AutoWrappedLinear, AutoWrappedModule,
                                enable_vram_management)
 from .base import BasePipeline
 
+# --- Add custom exception --- #
+# Added/Ensured for cancellation handling
+class CancelledError(Exception):
+    """Custom exception for cancellation."""
+    pass
+# --------------------------- #
 
 class WanVideoPipeline(BasePipeline):
     def __init__(self, device="cuda", torch_dtype=torch.float16, tokenizer_path=None):
@@ -249,6 +257,7 @@ class WanVideoPipeline(BasePipeline):
         tile_stride=(15, 26),
         progress_bar_cmd=tqdm,
         progress_bar_st=None,
+        cancel_fn=None, # Added cancel_fn parameter
         **kwargs,
     ):
         # Parameter check
@@ -315,6 +324,14 @@ class WanVideoPipeline(BasePipeline):
             for progress_id, timestep in enumerate(
                 progress_bar_cmd(self.scheduler.timesteps)
             ):
+                # --- Add cancellation check --- #
+                # Check the cancellation flag before processing the step
+                if cancel_fn is not None and cancel_fn():
+                    print("[Pipeline] Cancellation requested via cancel_fn.")
+                    # Raise the specific error to be caught upstream
+                    raise CancelledError("Video generation cancelled by pipeline check")
+                # ----------------------------- #
+
                 timestep = timestep.unsqueeze(0).to(
                     dtype=torch.float32, device=self.device
                 )
@@ -387,3 +404,5 @@ class WanVideoPipeline(BasePipeline):
         frames = self.tensor2video(frames[0])
 
         return frames
+
+# --- END OF FILE wan_video.py ---
