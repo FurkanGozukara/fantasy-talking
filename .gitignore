@@ -13,3 +13,4 @@ output/
 temp_audios
 venv/
 outputs
+used_audios
