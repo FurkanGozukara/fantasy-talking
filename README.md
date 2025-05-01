@@ -5,13 +5,7 @@ https://github.com/user-attachments/assets/3d58b64d-2f99-4ab3-9a81-200839a0869e
 ![screencapture-127-0-0-1-7860-2025-05-01-13_12_32](https://github.com/user-attachments/assets/69044597-29bc-49e2-b677-a544607c01c4)
 
 
-# FantasyTalking SECourses App - Version Comparison & Improvements
-
-This document outlines the significant improvements, new features, and changes made in the updated FantasyTalking application (`secourses_app.py`, `infer.py`, `wan_video.py`) compared to the previous version (`old_app.py`, `old_infer.py`, `old_wan_video.py`).
-
-The new version represents a major overhaul focused on enhancing user experience, adding powerful features, improving performance control, and increasing robustness.
-
----
+# FantasyTalking SECourses App New Features
 
 ## Major New Features & Enhancements
 
