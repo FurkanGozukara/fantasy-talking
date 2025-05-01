@@ -11,3 +11,4 @@ diffsynth/vram_management/__pycache__/
 models/
 output/
 venv/
+outputs
