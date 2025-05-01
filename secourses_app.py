@@ -1125,9 +1125,9 @@ def handle_cancel():
 with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V11)", theme=gr.themes.Soft()) as demo: # Updated title
     gr.Markdown(
         """
-    # FantasyTalking: Realistic Talking Portrait Generation SECourses App V11 - Multi-Prompt Update
+    # FantasyTalking: Realistic Talking Portrait Generation SECourses App V11 - https://www.patreon.com/posts/127855145
     Generate a talking head video from an image and audio, or process a batch of images. Supports multiple prompts per generation.
-    [GitHub](https://github.com/Fantasy-AMAP/fantasy-talking) | [arXiv Paper](https://arxiv.org/abs/2504.04842) | [Patreon Post](https://www.patreon.com/posts/127855145)
+    [GitHub](https://github.com/Fantasy-AMAP/fantasy-talking) | [arXiv Paper](https://arxiv.org/abs/2504.04842)
     """
     ) # Updated description slightly
 
