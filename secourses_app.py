@@ -1,4 +1,3 @@
-# --- START OF FILE secourses_app.py ---
 import platform
 import argparse
 import sys
@@ -12,6 +11,7 @@ import time # Added for potential delays/checks
 import traceback # Added for detailed error logging
 import json # Added for batch processing prompt reading
 import uuid # Added for unique temporary filenames
+import re # <<< Added for prompt parsing
 
 import gradio as gr
 import librosa
@@ -83,11 +83,11 @@ VRAM_PRESETS = {
     "8GB GPUs": "0",
     "10GB GPUs": "0",
     "12GB GPUs": "0",
-    "16GB GPUs": "0", 
+    "16GB GPUs": "0",
     "24GB GPUs": "6,000,000,000",
-    "32GB GPUs": "8,000,000,000", 
-    "48GB GPUs": "22,000,000,000", 
-    "80GB GPUs": "32,000,000,000", 
+    "32GB GPUs": "8,000,000,000",
+    "48GB GPUs": "22,000,000,000",
+    "80GB GPUs": "32,000,000,000",
 }
 VRAM_PRESET_DEFAULT = "24GB GPUs" # Adjusted default based on new names
 
@@ -137,7 +137,6 @@ def save_last_used_preset(preset_name):
         gr.Warning("Failed to save the last used preset setting.")
 
 # --- REMOVED get_latest_preset_name ---
-# def get_latest_preset_name(): ... (Removed)
 
 
 def get_default_settings():
@@ -146,6 +145,7 @@ def get_default_settings():
     return {
         # Inputs / Basic
         "prompt_input": DEFAULT_PROMPT,
+        "enable_multi_line_prompts_checkbox": False, # <<< Added default
         "negative_prompt_input": DEFAULT_NEGATIVE_PROMPT,
         "torch_dtype_dropdown": TORCH_DTYPE_DEFAULT,
         "tiled_vae_checkbox": True,
@@ -207,7 +207,9 @@ SETTING_COMPONENTS_VARS = []
 # --- Define the list of setting variable names globally ---
 SETTING_COMPONENTS_VARS = [
     # Left Column
-    "prompt_input", "negative_prompt_input",
+    "prompt_input",
+    "enable_multi_line_prompts_checkbox", # <<< Added
+    "negative_prompt_input",
     "torch_dtype_dropdown", "tiled_vae_checkbox",
     "width_input", "height_input", "duration_input", "fps_input", "num_generations_input",
     "prompt_cfg_scale", "audio_cfg_scale", "audio_weight",
@@ -270,6 +272,7 @@ def load_preset(preset_name):
         gr.Error(f"Preset '{preset_name}' not found.")
         # Return updates that do nothing (empty list or list of Nones?)
         # Let's return Nones, assuming len(SETTING_COMPONENTS_VARS) is correct
+        # <<< Ensure the returned list has the correct length >>>
         return [None] * len(SETTING_COMPONENTS_VARS) # Must return list of correct length
 
     try:
@@ -282,12 +285,20 @@ def load_preset(preset_name):
 
         updates = []
         for var_name in SETTING_COMPONENTS_VARS:
-            if var_name in loaded_settings:
-                updates.append(gr.update(value=loaded_settings[var_name]))
+            # <<< Use get with default to handle missing keys gracefully >>>
+            setting_value = loaded_settings.get(var_name)
+            if setting_value is not None:
+                 # Special case: handle boolean default potentially missing from old presets
+                if var_name == "enable_multi_line_prompts_checkbox" and var_name not in loaded_settings:
+                    print(f"[Warning][Presets] Setting '{var_name}' not found in preset '{preset_name}'. Using default False.")
+                    updates.append(gr.update(value=False)) # Default to False if missing
+                else:
+                    updates.append(gr.update(value=setting_value))
             else:
                 # If a setting from the current UI is missing in the preset file,
-                # don't update it (keep its current value).
-                print(f"[Warning][Presets] Setting '{var_name}' not found in preset '{preset_name}'. Keeping current value.")
+                # don't update it (keep its current value), except for the new checkbox handled above.
+                if var_name != "enable_multi_line_prompts_checkbox": # Avoid double warning
+                     print(f"[Warning][Presets] Setting '{var_name}' not found in preset '{preset_name}'. Keeping current value.")
                 updates.append(gr.update()) # Send an empty update
 
         # Special handling for VRAM dropdown -> textbox link
@@ -326,6 +337,21 @@ def load_preset(preset_name):
         return [None] * len(SETTING_COMPONENTS_VARS)
 
 # --- End Core Preset Save/Load Functions ---
+
+# <<< Added Prompt Parsing Helper >>>
+def parse_prompts(text: str, min_len: int = 2) -> list[str]:
+    """Splits text by newline, trims, filters by length, returns list or default."""
+    if not text:
+        return [DEFAULT_PROMPT]
+    lines = text.splitlines()
+    parsed = [line.strip() for line in lines]
+    filtered = [line for line in parsed if len(line) >= min_len]
+    if not filtered:
+        print(f"[Prompt Parsing] No valid prompts found after filtering (min_len={min_len}). Using default prompt.")
+        return [DEFAULT_PROMPT]
+    # print(f"[Prompt Parsing] Parsed {len(filtered)} prompts: {filtered}") # Debug
+    return filtered
+# <<< End Added >>>
 
 def calculate_frames(duration_sec, fps):
     """Calculates the frame count needed for the pipeline (4k+1 format)."""
@@ -413,13 +439,14 @@ def generate_video(
     image_path,
     audio_path,
     prompt,
+    enable_multi_line_prompts, # <<< Added
     negative_prompt,
     # Basic Settings
     width,
     height,
     duration_seconds,
     fps,
-    num_generations, # Added
+    num_generations, # Number of variations per prompt
     # CFG & Weights
     prompt_cfg_scale,
     audio_cfg_scale,
@@ -432,14 +459,14 @@ def generate_video(
     sigma_shift,
     denoising_strength,
     save_video_quality,
-    save_metadata, # Added
+    save_metadata,
     # Performance
     tiled_vae,
     tile_size_h,
     tile_size_w,
     tile_stride_h,
     tile_stride_w,
-    vram_custom_value_input_param, # Renamed for clarity (comes from Textbox)
+    vram_custom_value_input_param,
     torch_dtype_str,
     progress=gr.Progress()
 ):
@@ -448,366 +475,247 @@ def generate_video(
     global current_torch_dtype, current_num_persistent_param_in_dit
     global is_generating, is_cancelling, cancel_requested
 
-    # *** ADDED DEBUG PRINT ***
-    print(f"\n>>> generate_video called. Current state: is_generating={is_generating}, is_cancelling={is_cancelling}, cancel_requested={cancel_requested}")
+    print(f"\n>>> generate_video called. Multi-line enabled: {enable_multi_line_prompts}. Current state: is_generating={is_generating}, is_cancelling={is_cancelling}, cancel_requested={cancel_requested}")
 
     # --- State Check ---
-    if is_generating:
-        print("[State Check] Generation is already in progress. Ignoring new request.")
-        gr.Info("A generation task is already running. Please wait.")
-        return None # Return None as no new video is generated
-    if is_cancelling:
-        print("[State Check] Cancellation is in progress. Ignoring new request.")
-        gr.Info("Cancellation is in progress. Please wait before starting a new task.")
-        return None
-    # -----------------
+    if is_generating: print("[State Check] Generation already in progress."); gr.Info("A generation task is already running."); return None
+    if is_cancelling: print("[State Check] Cancellation in progress."); gr.Info("Cancellation is in progress."); return None
 
     # --- Set State ---
-    is_generating = True
-    # is_cancelling = False # Should be false unless cancel button sets it
-    cancel_requested = False # Reset cancel request flag
+    is_generating = True; cancel_requested = False
     print(f"[State Check] Set flags at start: is_generating={is_generating}, is_cancelling={is_cancelling}, cancel_requested={cancel_requested}")
-    # -----------------
 
-    output_video_path = None # Track the last generated video path
+    output_video_path = None
 
     try:
         # --- Input Validation ---
         progress(0, desc="Validating inputs...")
         print("[Validation] Validating inputs...")
-        if image_path is None:
-            raise gr.Error("Input Image is required. Please upload an image.")
-        if audio_path is None:
-            raise gr.Error("Input Audio is required. Please upload or record audio.")
+        if image_path is None: raise gr.Error("Input Image is required.")
+        if audio_path is None: raise gr.Error("Input Audio is required.")
 
-        # Validate dimensions
-        try:
-             width = int(width)
-             height = int(height)
-             if width <= 0 or width % 16 != 0:
-                  gr.Warning(f"Invalid width ({width}) or not divisible by 16. Using default: {DEFAULT_WIDTH}")
-                  width = DEFAULT_WIDTH
-             if height <= 0 or height % 16 != 0:
-                  gr.Warning(f"Invalid height ({height}) or not divisible by 16. Using default: {DEFAULT_HEIGHT}")
-                  height = DEFAULT_HEIGHT
-        except (ValueError, TypeError):
-             gr.Warning(f"Invalid width/height input. Using defaults: {DEFAULT_WIDTH}x{DEFAULT_HEIGHT}")
-             width = DEFAULT_WIDTH
-             height = DEFAULT_HEIGHT
-
-        # Validate duration and FPS
-        try:
-            duration_seconds = float(duration_seconds)
-            if duration_seconds <= 0:
-                gr.Warning(f"Invalid duration ({duration_seconds}), using default: {DEFAULT_DURATION}s")
-                duration_seconds = DEFAULT_DURATION
-            duration_seconds = min(duration_seconds, MAX_DURATION) # Apply max duration cap
-        except (ValueError, TypeError):
-            gr.Warning(f"Invalid duration input. Using default: {DEFAULT_DURATION}s")
-            duration_seconds = DEFAULT_DURATION
-
-        try:
-            fps = int(fps)
-            if fps <= 0:
-                 gr.Warning(f"Invalid FPS ({fps}), using default: {DEFAULT_FPS}")
-                 fps = DEFAULT_FPS
-        except (ValueError, TypeError):
-             gr.Warning(f"Invalid FPS input. Using default: {DEFAULT_FPS}")
-             fps = DEFAULT_FPS
-
-        # Validate num_generations
-        try:
-             num_generations = int(num_generations)
-             if num_generations < 1:
-                  gr.Warning("Number of generations must be at least 1. Setting to 1.")
-                  num_generations = 1
-        except (ValueError, TypeError):
-             gr.Warning("Invalid Number of Generations input. Setting to 1.")
-             num_generations = 1
-
-        # Validate seed
+        # (Validation for width, height, duration, fps, num_generations, seed remains the same)
+        try: width = int(width); height = int(height)
+        except: width, height = DEFAULT_WIDTH, DEFAULT_HEIGHT
+        if width <= 0 or width % 16 != 0: width = DEFAULT_WIDTH; gr.Warning(f"Invalid width, using default {DEFAULT_WIDTH}")
+        if height <= 0 or height % 16 != 0: height = DEFAULT_HEIGHT; gr.Warning(f"Invalid height, using default {DEFAULT_HEIGHT}")
+        try: duration_seconds = float(duration_seconds); duration_seconds = max(1, min(duration_seconds, MAX_DURATION))
+        except: duration_seconds = DEFAULT_DURATION; gr.Warning("Invalid duration, using default")
+        try: fps = int(fps); fps = max(1, fps)
+        except: fps = DEFAULT_FPS; gr.Warning("Invalid FPS, using default")
+        try: num_generations = int(num_generations); num_generations = max(1, num_generations)
+        except: num_generations = 1; gr.Warning("Invalid num generations, using 1")
         initial_seed = DEFAULT_SEED
-        try:
-            initial_seed = int(seed)
-            if initial_seed < 0:
-                 gr.Warning(f"Seed cannot be negative ({initial_seed}). Using default: {DEFAULT_SEED}")
-                 initial_seed = DEFAULT_SEED
-        except (ValueError, TypeError):
-            if not use_random_seed: # Only warn if fixed seed was intended but invalid
-                gr.Warning(f"Invalid seed value ('{seed}'). Using default: {DEFAULT_SEED}")
-            initial_seed = DEFAULT_SEED # Use default if parsing fails
+        try: initial_seed = int(seed); initial_seed = max(0, initial_seed)
+        except: initial_seed = DEFAULT_SEED; gr.Warning("Invalid seed, using default")
+        print(f"[Validation] Inputs validated. Variations per prompt={num_generations}, Use Random Seed={use_random_seed}, Initial Seed={initial_seed}")
 
-        print(f"[Validation] Inputs validated. Num Generations={num_generations}, Use Random Seed={use_random_seed}, Initial Seed={initial_seed}")
+        # --- Audio Handling (Removed complex extraction, assuming direct audio path) ---
+        audio_path_to_use = audio_path
 
-        # --- Audio Handling (Extraction if Video) ---
-        # progress(0.15, desc="Processing audio input...")
-        # original_audio_path = audio_path
-        # audio_path_to_use = None
-        # temp_audio_file = None
-        # delete_temp_audio = False
-        #
-        # # Check if input is a video file based on common video extensions
-        # video_extensions = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.flv'}
-        # input_audio_path_obj = Path(original_audio_path)
-        # is_video = input_audio_path_obj.suffix.lower() in video_extensions
-        #
-        # if is_video:
-        #     print(f\"[Audio Proc] Input '{input_audio_path_obj.name}' detected as video. Extracting audio...\")
-        #     # Generate a unique temporary filename for the extracted audio
-        #     temp_audio_filename = f\"extracted_audio_{uuid.uuid4()}.wav\"
-        #     temp_audio_file = TEMP_AUDIO_DIR / temp_audio_filename
-        #
-        #     # Construct the ffmpeg command
-        #     # ... (ffmpeg command removed)
-        #     print(f\"[Audio Proc] Running ffmpeg command: {' '.join(ffmpeg_command)}\")
-        #     try:
-        #         # ... (subprocess.run removed)
-        #         if not temp_audio_file.exists() or temp_audio_file.stat().st_size == 0:
-        #              raise RuntimeError(\"FFmpeg finished but output file is missing or empty.\")
-        #         print(f\"[Audio Proc] Audio successfully extracted to: {temp_audio_file}\")
-        #         audio_path_to_use = str(temp_audio_file.resolve())
-        #         delete_temp_audio = True # Mark for deletion later
-        #     except subprocess.CalledProcessError as e:
-        #         # ... (error handling removed)
-        #         raise gr.Error(f\"Failed to extract audio from video: {input_audio_path_obj.name}. Check ffmpeg installation and video file. Error: {e.stderr[:500]}...\")
-        #     except Exception as e:
-        #          # ... (error handling removed)
-        #          raise gr.Error(f\"Failed to process video input {input_audio_path_obj.name}. Error: {e}\")
-        # else:
-        #     print(f\"[Audio Proc] Input '{input_audio_path_obj.name}' detected as audio. Using directly.\")
-        #     audio_path_to_use = original_audio_path # Use the original audio path
-        audio_path_to_use = audio_path # Assume audio_path is always the correct audio file
-
-        # --- Calculate Target Duration & Frames (using audio_path_to_use) ---
-        progress(0.1, desc="Calculating duration...") # Start progress earlier
+        # --- Calculate Target Duration & Frames ---
+        progress(0.1, desc="Calculating duration...")
         target_duration = duration_seconds
         try:
-            # Use the potentially extracted audio path here
             actual_audio_duration = librosa.get_duration(filename=audio_path_to_use)
-            print(f"[Audio Info] Effective audio duration (from '{Path(audio_path_to_use).name}'): {actual_audio_duration:.2f}s")
+            print(f"[Audio Info] Effective audio duration: {actual_audio_duration:.2f}s")
             if actual_audio_duration < duration_seconds:
-                gr.Warning(f"Requested duration ({duration_seconds}s) is longer than effective audio ({actual_audio_duration:.2f}s). Using audio duration.")
+                gr.Warning(f"Requested duration ({duration_seconds}s) > audio ({actual_audio_duration:.2f}s). Using audio duration.")
                 target_duration = actual_audio_duration
-            elif actual_audio_duration <= 0:
-                 raise ValueError("Effective audio duration is zero or negative.")
-
-        except Exception as e:
-            print(f"[Error] Could not read effective audio file duration: {audio_path_to_use}. Error: {e}")
-            traceback.print_exc()
-            # Refer to the original input name in the error message
-            input_audio_path_obj = Path(audio_path_to_use) # Get path object for name
-            raise gr.Error(f"Could not read audio data from input '{input_audio_path_obj.name}'. Please check the file. Error: {e}")
+            if actual_audio_duration <= 0: raise ValueError("Effective audio duration <= 0.")
+        except Exception as e: raise gr.Error(f"Could not read audio data from '{Path(audio_path_to_use).name}'. Error: {e}")
 
         num_frames = calculate_frames(target_duration, fps)
-        print(f"[Calculation] Target duration: {target_duration:.2f}s, Target FPS: {fps}, Calculated num_frames: {num_frames}")
-        if num_frames <= 1:
-             # Refer to the original input name in the error message
-             input_audio_path_obj = Path(audio_path_to_use) # Get path object for name
-             raise gr.Error(f"Calculated number of frames for '{input_audio_path_obj.name}' is {num_frames}. Too low, check audio length/FPS.")
-
+        print(f"[Calculation] Target duration: {target_duration:.2f}s, FPS: {fps}, Calculated num_frames: {num_frames}")
+        if num_frames <= 1: raise gr.Error(f"Calculated frames for '{Path(audio_path_to_use).name}' too low ({num_frames}). Check audio/FPS.")
 
         # --- Prepare Paths and Folders ---
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        print(f"[File System] Ensured output directory exists: {OUTPUT_DIR}")
-        try:
-            image_path_abs = Path(image_path).resolve().as_posix()
-            # Use the potentially extracted audio path here
-            audio_path_abs = Path(audio_path_to_use).resolve().as_posix()
-        except Exception as e:
-             raise gr.Error(f"Invalid input file path provided. Error: {e}")
-
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True); print(f"[File System] Ensured output directory: {OUTPUT_DIR}")
+        try: image_path_abs = Path(image_path).resolve().as_posix(); audio_path_abs = Path(audio_path_to_use).resolve().as_posix()
+        except Exception as e: raise gr.Error(f"Invalid input file path. Error: {e}")
 
         # --- Model Loading / Reloading ---
-        # Use progress value 0.2 as audio processing is done
-        progress(0.2, desc="Checking model status...")
+        progress(0.15, desc="Checking model status...") # Moved slightly earlier
         num_persistent_param_in_dit = parse_persistent_params(vram_custom_value_input_param)
         torch_dtype = get_torch_dtype(torch_dtype_str)
 
         load_needed = False
-        if not models_loaded:
-            load_needed = True
-            print("[Model Check] Models not loaded yet.")
-        elif current_torch_dtype != torch_dtype:
-            load_needed = True
-            print(f"[Model Check] Torch dtype changed ({current_torch_dtype} -> {torch_dtype}). Reloading models.")
-        elif current_num_persistent_param_in_dit != num_persistent_param_in_dit:
-            load_needed = True
-            # Format None nicely for printing
-            current_persist_str = str(current_num_persistent_param_in_dit) if current_num_persistent_param_in_dit is not None else "None"
-            new_persist_str = str(num_persistent_param_in_dit) if num_persistent_param_in_dit is not None else "None"
-            print(f"[Model Check] VRAM persistence changed ({current_persist_str} -> {new_persist_str}). Reloading models.")
+        if not models_loaded: load_needed = True; print("[Model Check] Models not loaded yet.")
+        elif current_torch_dtype != torch_dtype: load_needed = True; print(f"[Model Check] DType changed. Reloading.")
+        elif current_num_persistent_param_in_dit != num_persistent_param_in_dit: load_needed = True; print(f"[Model Check] VRAM persistence changed. Reloading.")
 
         if load_needed:
-            print("[Model Loading] Unloading previous models (if any) and clearing cache...")
-            # Explicitly release references
-            pipe, fantasytalking, wav2vec_processor, wav2vec = None, None, None, None
-            models_loaded = False
-            torch.cuda.empty_cache()
-            print("[Model Loading] Cache cleared. Starting model load...")
-            progress(0.15, desc="Loading models (can take time)...")
+            print("[Model Loading] Unloading/Reloading models...")
+            pipe, fantasytalking, wav2vec_processor, wav2vec = None, None, None, None; models_loaded = False; torch.cuda.empty_cache()
+            progress(0.2, desc="Loading models (can take time)...") # Adjusted progress timing
             try:
-                pipe, fantasytalking, wav2vec_processor, wav2vec = load_models(
-                    wan_model_dir=MODEL_DIRS["wan_model_dir"],
-                    fantasytalking_model_path=MODEL_DIRS["fantasytalking_model_path"],
-                    wav2vec_model_dir=MODEL_DIRS["wav2vec_model_dir"],
-                    # Pass the parsed value (int or None)
-                    num_persistent_param_in_dit=num_persistent_param_in_dit,
-                    torch_dtype=torch_dtype,
-                    device="cuda" # Assuming CUDA is desired
-                )
-                models_loaded = True
-                current_torch_dtype = torch_dtype
-                current_num_persistent_param_in_dit = num_persistent_param_in_dit
+                pipe, fantasytalking, wav2vec_processor, wav2vec = load_models(MODEL_DIRS["wan_model_dir"], MODEL_DIRS["fantasytalking_model_path"], MODEL_DIRS["wav2vec_model_dir"], num_persistent_param_in_dit, torch_dtype, "cuda")
+                models_loaded = True; current_torch_dtype = torch_dtype; current_num_persistent_param_in_dit = num_persistent_param_in_dit
                 print("[Model Loading] Models loaded successfully.")
-            except Exception as e:
-                print(f"[Error] CRITICAL ERROR loading models: {str(e)}")
-                traceback.print_exc()
-                models_loaded = False
-                # Clear potentially partially loaded models
-                pipe, fantasytalking, wav2vec_processor, wav2vec = None, None, None, None
-                torch.cuda.empty_cache()
-                raise gr.Error(f"Failed to load models. Check paths, VRAM, and console logs. Error: {str(e)}")
+            except Exception as e: print(f"[Error] CRITICAL ERROR loading models: {e}"); traceback.print_exc(); raise gr.Error(f"Failed to load models. Error: {e}")
+        else: print("[Model Check] Models ready.")
+
+        # --- <<< Prompt Parsing >>> ---
+        if enable_multi_line_prompts:
+            prompt_lines = parse_prompts(prompt)
+            print(f"[Prompt Info] Multi-line enabled. Parsed {len(prompt_lines)} prompt(s).")
         else:
-            print("[Model Check] Models already loaded and configuration matches. Skipping reload.")
+            prompt_lines = [prompt if prompt else DEFAULT_PROMPT]
+            print("[Prompt Info] Multi-line disabled. Using single prompt.")
+        num_prompts = len(prompt_lines)
 
-
-        # --- Generation Loop ---
-        print(f"[Generation] Starting generation loop for {num_generations} video(s)...")
-        # Define cancel function based on global flag
+        # --- Generation Loops ---
+        total_iterations = num_prompts * num_generations
+        current_iteration = 0
+        print(f"[Generation] Starting generation loops for {num_prompts} prompt(s) x {num_generations} variation(s) = {total_iterations} total video(s)...")
         cancel_fn = lambda: cancel_requested
 
-        for i in range(num_generations):
-            current_gen_index = i + 1
-            progress_desc = f"Generating video {current_gen_index}/{num_generations}..."
-            progress((i / num_generations) * 0.6 + 0.3, desc=progress_desc) # Scale progress: 0.3 to 0.9
-
-            # --- Cancellation Check (before starting expensive work) ---
-            if cancel_requested:
-                print(f"[Cancellation] Cancellation detected before starting generation {current_gen_index}.")
-                gr.Warning("Generation cancelled by user.")
-                break # Exit the loop
-
-            # --- Determine Seed for Current Generation ---
-            current_seed = 0
-            if use_random_seed:
-                current_seed = random.randint(0, 2**32 - 1)
-                print(f"[Seed Info][Gen {current_gen_index}/{num_generations}] Using random seed: {current_seed}")
-            else:
-                current_seed = initial_seed + i
-                print(f"[Seed Info][Gen {current_gen_index}/{num_generations}] Using fixed seed: {current_seed} (Initial: {initial_seed} + {i})")
-
-            # --- Prepare Arguments for infer.main ---
-            print(f"[Args Prep][Gen {current_gen_index}/{num_generations}] Preparing arguments for infer.main...")
-            args_dict = {
-                "image_path": image_path_abs,
-                "audio_path": audio_path_abs,
-                "prompt": prompt if prompt else DEFAULT_PROMPT,
-                "negative_prompt": negative_prompt,
-                "output_dir": str(OUTPUT_DIR),
-                "width": width,
-                "height": height,
-                "num_frames": num_frames, # Use calculated num_frames
-                "fps": fps,
-                "audio_weight": float(audio_weight),
-                "prompt_cfg_scale": float(prompt_cfg_scale),
-                "audio_cfg_scale": float(audio_cfg_scale),
-                "inference_steps": int(inference_steps),
-                "seed": current_seed, # Use calculated seed
-                "tiled_vae": bool(tiled_vae),
-                "tile_size_h": int(tile_size_h),
-                "tile_size_w": int(tile_size_w),
-                "tile_stride_h": int(tile_stride_h),
-                "tile_stride_w": int(tile_stride_w),
-                "sigma_shift": float(sigma_shift),
-                "denoising_strength": float(denoising_strength),
-                "save_video_quality": int(save_video_quality),
-                "save_metadata": bool(save_metadata), # Pass metadata flag
-                # Control info for logging/naming in infer.py
-                "generation_index": current_gen_index,
-                "total_generations": num_generations,
-                "output_base_name": None, # Use None for sequential naming (0001, 0002...)
-            }
-
-            # --- Execute Generation ---
-            print(f"[Execution][Gen {current_gen_index}/{num_generations}] Calling infer.main...")
+        # --- <<< ADDED: Calculate Sequential Base Name (if not batch/random variations) >>> ---
+        # Calculate only if num_generations > 1 OR num_prompts > 1, AND not using random seeds,
+        # to avoid unnecessary calculation and potential conflicts with truly random seeds giving same number.
+        # If it's just one generation (1 prompt, 1 variation), infer.py can handle the sequential naming itself.
+        sequential_base_name = None
+        # Simplified condition: Calculate base name if we are generating more than one output video
+        # for this *single* call to generate_video.
+        if total_iterations > 1:
+            print(f"[Sequential Naming] Calculating base name for {total_iterations} variations...")
+            max_sequence_num = -1 # Start checking from 0000
+            # Regex to find filenames starting with 4 digits, optionally followed by _promptX or _variationX
+            # We look for the base 4 digits only.
+            sequence_pattern = re.compile(r"^(\d{4}).*?\.(mp4|txt)$")
             try:
-                # *** Pass cancel_fn and gradio_progress to main ***
-                output_video_path = main(
-                    args_dict, pipe, fantasytalking, wav2vec_processor, wav2vec,
-                    cancel_fn=cancel_fn,
-                    gradio_progress=progress
-                )
-                print(f"[Execution][Gen {current_gen_index}/{num_generations}] infer.main completed. Output: {output_video_path}")
-                # Update progress after successful generation
-                progress(((i + 1) / num_generations) * 0.6 + 0.3, desc=f"Finished video {current_gen_index}/{num_generations}")
-
-            except CancelledError as ce:
-                print(f"[Cancellation][Gen {current_gen_index}/{num_generations}] Caught CancelledError from infer.main: {ce}")
-                gr.Warning(f"Generation {current_gen_index}/{num_generations} cancelled by user.")
-                # Attempt to unload models cleanly after cancellation
-                if pipe is not None and hasattr(pipe, 'load_models_to_device') and callable(getattr(pipe, 'load_models_to_device')):
-                    print("[Cancellation] Attempting to unload models from GPU due to cancellation...")
-                    try:
-                        # Assuming [] triggers offload based on wan_video.py logic
-                        pipe.load_models_to_device([])
-                        print("[Cancellation] Models unloaded/offloaded.")
-                    except Exception as unload_e:
-                        print(f"[Warning] Error during model unloading on cancel: {unload_e}")
-                # *** Break the loop after handling cancellation ***
-                break # Stop generation loop immediately on cancel
-
+                OUTPUT_DIR.mkdir(parents=True, exist_ok=True) # Ensure dir exists
+                for filename in os.listdir(OUTPUT_DIR):
+                    match = sequence_pattern.match(filename)
+                    if match:
+                        num = int(match.group(1))
+                        if num > max_sequence_num:
+                            max_sequence_num = num
+                print(f"[Sequential Naming] Highest sequence number found: {max_sequence_num if max_sequence_num >= 0 else 'None'}")
             except Exception as e:
-                print(f"[Error][Gen {current_gen_index}/{num_generations}] An error occurred during infer.main: {str(e)}")
-                print(f"Exception type: {type(e)}")
-                traceback.print_exc()
-                # Attempt to clear cache
-                print("[Error] Attempting to clear CUDA cache after error...")
-                torch.cuda.empty_cache()
-                print("[Error] CUDA cache clear attempted.")
-                # Raise a Gradio error to notify the user, stopping the loop
-                raise gr.Error(f"Error during video generation {current_gen_index}/{num_generations}: {str(e)}")
+                print(f"[Warning][Sequential Naming] Error scanning output directory: {e}. Starting sequence from 0.")
+                max_sequence_num = -1 # Default to -1 on error, so next is 0
 
-        # --- Loop Finished ---
+            next_sequence_num = max_sequence_num + 1
+            sequential_base_name = f"{next_sequence_num:04d}"
+            print(f"[Sequential Naming] Using base sequence number '{sequential_base_name}' for this run.")
+        else:
+            print(f"[Sequential Naming] Single generation requested ({total_iterations} total). `infer.py` will handle sequential naming if needed.")
+        # <<< END ADDED >>>
+
+        # Outer loop: Prompts
+        for p_idx, current_prompt in enumerate(prompt_lines):
+            prompt_index_for_args = p_idx + 1 if enable_multi_line_prompts and num_prompts > 1 else None # 1-based index or None
+
+            print(f"\n--- Processing Prompt {p_idx + 1}/{num_prompts} ---")
+            if enable_multi_line_prompts: print(f"Prompt: '{current_prompt}'")
+
+            # Inner loop: Variations (Number of Generations)
+            for i in range(num_generations):
+                current_gen_index = i + 1 # Variation index (1-based)
+                current_iteration += 1
+
+                progress_desc = f"Prompt {p_idx + 1}/{num_prompts}, Variation {current_gen_index}/{num_generations} ({current_iteration}/{total_iterations})"
+                progress(current_iteration / total_iterations * 0.7 + 0.25, desc=progress_desc) # Scale progress: 0.25 to 0.95
+
+                # --- Cancellation Check ---
+                if cancel_requested:
+                    print(f"[Cancellation] Cancellation detected before Prompt {p_idx+1}, Variation {current_gen_index}.")
+                    gr.Warning("Generation cancelled by user.")
+                    # Set flag to break outer loop as well
+                    cancel_requested = True # Signal outer loop to break
+                    break # Exit inner (variation) loop
+
+                # --- Determine Seed ---
+                current_seed = 0
+                if use_random_seed:
+                    current_seed = random.randint(0, 2**32 - 1)
+                else:
+                    # Seed depends on both prompt index and variation index if multiple prompts/variations
+                    current_seed = initial_seed + p_idx * num_generations + i
+                print(f"[Seed Info][Prompt {p_idx+1}][Var {current_gen_index}] Using seed: {current_seed}")
+
+                # --- Prepare Arguments for infer.main ---
+                print(f"[Args Prep][Prompt {p_idx+1}][Var {current_gen_index}] Preparing arguments for infer.main...")
+                args_dict = {
+                    "image_path": image_path_abs,
+                    "audio_path": audio_path_abs,
+                    "prompt": current_prompt, # <<< Use the current prompt line
+                    "negative_prompt": negative_prompt,
+                    "output_dir": str(OUTPUT_DIR),
+                    "width": width,
+                    "height": height,
+                    "num_frames": num_frames,
+                    "fps": fps,
+                    "audio_weight": float(audio_weight),
+                    "prompt_cfg_scale": float(prompt_cfg_scale),
+                    "audio_cfg_scale": float(audio_cfg_scale),
+                    "inference_steps": int(inference_steps),
+                    "seed": current_seed,
+                    "tiled_vae": bool(tiled_vae),
+                    "tile_size_h": int(tile_size_h), "tile_size_w": int(tile_size_w),
+                    "tile_stride_h": int(tile_stride_h), "tile_stride_w": int(tile_stride_w),
+                    "sigma_shift": float(sigma_shift),
+                    "denoising_strength": float(denoising_strength),
+                    "save_video_quality": int(save_video_quality),
+                    "save_metadata": bool(save_metadata),
+                    # Control info for logging/naming in infer.py
+                    "generation_index": current_gen_index, # Variation index (1-based)
+                    "total_generations": num_generations, # Total variations for *this* prompt
+                    "prompt_index": prompt_index_for_args, # <<< Pass prompt index (or None)
+                    "output_base_name": sequential_base_name, # <<< Pass calculated base name (or None if single gen)
+                }
+
+                # --- Execute Generation ---
+                exec_log_prefix = f"[Exec][P{p_idx+1}][V{current_gen_index}]"
+                print(f"{exec_log_prefix} Calling infer.main...")
+                try:
+                    output_video_path = main(args_dict, pipe, fantasytalking, wav2vec_processor, wav2vec, cancel_fn=cancel_fn, gradio_progress=progress)
+                    print(f"{exec_log_prefix} infer.main completed. Output: {output_video_path}")
+                    # Update progress *after* successful generation inside loop
+                    # progress calculation is already handled before calling main
+
+                except CancelledError as ce:
+                    print(f"{exec_log_prefix} Caught CancelledError from infer.main: {ce}")
+                    gr.Warning(f"Generation cancelled by user during Prompt {p_idx+1}, Variation {current_gen_index}.")
+                    if pipe is not None and hasattr(pipe, 'load_models_to_device'):
+                        try: print("[Cancellation] Unloading models..."); pipe.load_models_to_device([]); print("[Cancellation] Models unloaded.")
+                        except Exception as unload_e: print(f"[Warning] Error unloading on cancel: {unload_e}")
+                    cancel_requested = True # Signal outer loop break
+                    break # Break inner variation loop
+
+                except Exception as e:
+                    print(f"{exec_log_prefix} Error during infer.main: {e}"); traceback.print_exc()
+                    torch.cuda.empty_cache(); print("[Error] CUDA cache clear attempted.")
+                    raise gr.Error(f"Error during Prompt {p_idx+1}, Variation {current_gen_index}: {e}")
+
+            # --- End of Inner (Variation) Loop ---
+            if cancel_requested:
+                break # Break outer (prompt) loop if cancelled
+
+        # --- Loops Finished ---
         if not cancel_requested:
              progress(1.0, desc="All generations complete!")
-             print("[Generation] Generation loop finished.")
+             print(f"[Generation] All {total_iterations} generation tasks finished.")
         else:
-             print("[Generation] Generation loop exited due to cancellation.")
+             print("[Generation] Generation loops exited due to cancellation.")
 
-
-        # Return the path of the *last* successfully generated video
         return output_video_path
 
-
-    except gr.Error as gr_e: # Catch Gradio-specific errors (validation, etc.)
-         print(f"[Gradio Error] {gr_e}")
-         # No need to raise again, Gradio handles it
-         return None # Indicate failure
-    except Exception as e: # Catch unexpected errors
-         print(f"[Error] An unexpected error occurred in generate_video: {str(e)}")
-         traceback.print_exc()
-         gr.Error(f"An unexpected error occurred: {str(e)}") # Show error in UI
-         return None # Indicate failure
+    except gr.Error as gr_e: print(f"[Gradio Error] {gr_e}"); return None
+    except Exception as e: print(f"[Error] Unexpected error in generate_video: {e}"); traceback.print_exc(); gr.Error(f"Unexpected error: {e}"); return None
     finally:
-        # --- Reset State ---
-        # *** ADDED DEBUG PRINTS ***
         print(f"[State Check] Entering FINALLY block for generate_video. Current state: is_generating={is_generating}, is_cancelling={is_cancelling}, cancel_requested={cancel_requested}")
-        is_generating = False
-        is_cancelling = False # Make absolutely sure this is reset
-        cancel_requested = False # Reset request flag too
+        is_generating = False; is_cancelling = False; cancel_requested = False # Reset all flags
         print(f"[State Check] Exiting FINALLY block for generate_video. Flags after reset: is_generating={is_generating}, is_cancelling={is_cancelling}, cancel_requested={cancel_requested}")
-        # Optional Cache Clear
-        # print("Clearing CUDA cache in finally block...")
-        # torch.cuda.empty_cache()
-        # print("CUDA cache cleared.")
+        # Optional: torch.cuda.empty_cache()
 
 # --- Function to Handle Video Upload and Audio Extraction ---
+# (No changes needed in handle_video_upload)
 def handle_video_upload(video_file_path, progress=gr.Progress()):
     """Extracts audio from video, saves to temp, returns path for gr.Audio update."""
     if video_file_path is None:
         print("[Video Handler] No video file provided.")
-        # Return None or current value? Return None might clear audio input if user cancels.
-        # Let's return an update to clear if no file is provided (or selection is cleared)
         return gr.Audio(value=None)
 
     progress(0, desc="Extracting audio from video...")
@@ -815,27 +723,30 @@ def handle_video_upload(video_file_path, progress=gr.Progress()):
     video_path_obj = Path(video_file_path)
     extracted_audio_path = None
 
+    # Ensure temp dir exists
+    TEMP_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+
     # Generate a unique temporary filename for the extracted audio
     temp_audio_filename = f"extracted_audio_{uuid.uuid4()}.wav"
     temp_audio_file = TEMP_AUDIO_DIR / temp_audio_filename
 
-    # Construct the ffmpeg command (similar to before, force mono WAV)
+    # Construct the ffmpeg command (force mono WAV)
     ffmpeg_command = [
         'ffmpeg',
         '-i', str(video_path_obj.resolve()),
-        '-vn',
-        '-acodec', 'pcm_s16le',
-        '-ar', '44100',
+        '-vn', # No video
+        '-acodec', 'pcm_s16le', # Standard WAV codec
+        '-ar', '44100', # Sample rate (adjust if needed)
         '-ac', '1', # Mono
-        '-y',
+        '-y', # Overwrite without asking
         str(temp_audio_file.resolve())
     ]
 
     print(f"[Video Handler] Running ffmpeg command: {' '.join(ffmpeg_command)}")
     try:
-        process = subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True, timeout=60) # Added timeout
-        print(f"[Video Handler] FFmpeg stdout: {process.stdout}")
-        print(f"[Video Handler] FFmpeg stderr: {process.stderr}")
+        process = subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True, encoding='utf-8', timeout=60) # Added encoding
+        # print(f"[Video Handler] FFmpeg stdout: {process.stdout}") # Can be verbose
+        # print(f"[Video Handler] FFmpeg stderr: {process.stderr}") # Often has useful info
         if not temp_audio_file.exists() or temp_audio_file.stat().st_size == 0:
              raise RuntimeError("FFmpeg finished but output file is missing or empty.")
 
@@ -844,24 +755,23 @@ def handle_video_upload(video_file_path, progress=gr.Progress()):
         progress(1, desc="Audio extracted!")
         gr.Info(f"Audio extracted from {video_path_obj.name} and loaded.")
         # Return the path to update the gr.Audio component
-        return gr.Audio(value=extracted_audio_path)
+        return gr.Audio(value=extracted_audio_path, label=f"Extracted Audio from {video_path_obj.name}") # Update label too
 
     except subprocess.TimeoutExpired:
         print(f"[Error][Video Handler] FFmpeg command timed out after 60 seconds.")
         gr.Warning("Audio extraction took too long and was cancelled.")
-        # Clean up potentially partially created file
         if temp_audio_file.exists(): temp_audio_file.unlink()
-        return gr.Audio(value=None) # Clear audio input on error
+        return gr.Audio(value=None) # Clear audio input
     except subprocess.CalledProcessError as e:
         print(f"[Error][Video Handler] FFmpeg failed with exit code {e.returncode}")
         print(f"[Error][Video Handler] FFmpeg stderr: {e.stderr}")
         gr.Error(f"Failed to extract audio from {video_path_obj.name}. Error: {e.stderr[:500]}...")
-        return gr.Audio(value=None) # Clear audio input on error
+        return gr.Audio(value=None) # Clear audio input
     except Exception as e:
          print(f"[Error][Video Handler] An unexpected error occurred during audio extraction: {e}")
          traceback.print_exc()
          gr.Error(f"Failed to process video {video_path_obj.name}. Error: {e}")
-         return gr.Audio(value=None) # Clear audio input on error
+         return gr.Audio(value=None) # Clear audio input
 
 
 # --- Batch Processing Function ---
@@ -876,13 +786,14 @@ def process_batch(
     image_input_fallback, # Not directly used, but good practice
     audio_input_fallback,
     prompt_fallback,
+    enable_multi_line_prompts, # <<< Added
     negative_prompt,
     # Basic Settings
     width,
     height,
     duration_seconds,
     fps,
-    num_generations_input, # <<< Added: Get number of variations per image
+    num_generations_input, # Num variations per prompt per image
     # CFG & Weights
     prompt_cfg_scale,
     audio_cfg_scale,
@@ -911,90 +822,55 @@ def process_batch(
     global current_torch_dtype, current_num_persistent_param_in_dit
     global is_generating, is_cancelling, cancel_requested
 
-    # *** ADDED DEBUG PRINT ***
-    print(f"\n>>> process_batch called. Current state: is_generating={is_generating}, is_cancelling={is_cancelling}, cancel_requested={cancel_requested}")
+    print(f"\n>>> process_batch called. Multi-line enabled: {enable_multi_line_prompts}. Current state: is_generating={is_generating}, is_cancelling={is_cancelling}, cancel_requested={cancel_requested}")
 
     # --- State Check ---
-    if is_generating:
-        print("[State Check][Batch] Generation/Batch is already in progress. Ignoring batch request.")
-        gr.Info("A generation or batch task is already running. Please wait.")
-        return None
-    if is_cancelling:
-        print("[State Check][Batch] Cancellation is in progress. Ignoring batch request.")
-        gr.Info("Cancellation is in progress. Please wait before starting a new task.")
-        return None
-    # -----------------
+    if is_generating: print("[State Check][Batch] Generation already in progress."); gr.Info("A generation task is already running."); return None
+    if is_cancelling: print("[State Check][Batch] Cancellation in progress."); gr.Info("Cancellation is in progress."); return None
 
     # --- Set State ---
-    is_generating = True # Use the same flag as single generation
-    # is_cancelling = False # Should be false unless cancel button sets it
-    cancel_requested = False
+    is_generating = True; cancel_requested = False
     print(f"[State Check][Batch] Set flags at start: is_generating={is_generating}, is_cancelling={is_cancelling}, cancel_requested={cancel_requested}")
-    # -----------------
 
     processed_files_count = 0
     skipped_files_count = 0
     error_files_count = 0
-    last_output_path = None # Track last successful output for potential return
+    last_output_path = None
 
     try:
         # --- Validate Batch Inputs ---
         progress(0, desc="Validating batch inputs...")
         print("[Validation][Batch] Validating batch inputs...")
-        if not batch_input_folder_str or not batch_output_folder_str:
-            raise gr.Error("Batch Input and Output folders must be specified.")
-
+        if not batch_input_folder_str or not batch_output_folder_str: raise gr.Error("Batch Input and Output folders must be specified.")
         batch_input_folder = Path(batch_input_folder_str)
         batch_output_folder = Path(batch_output_folder_str)
-
-        if not batch_input_folder.is_dir():
-            raise gr.Error(f"Batch Input folder not found or is not a directory: {batch_input_folder}")
-
-        # Ensure output folder exists
-        batch_output_folder.mkdir(parents=True, exist_ok=True)
-        print(f"[File System][Batch] Ensured batch output directory exists: {batch_output_folder}")
+        if not batch_input_folder.is_dir(): raise gr.Error(f"Batch Input folder not found: {batch_input_folder}")
+        batch_output_folder.mkdir(parents=True, exist_ok=True); print(f"[File System][Batch] Ensured batch output directory: {batch_output_folder}")
 
         # --- Find Image Files ---
-        image_extensions = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
-        print(f"[File System][Batch] Scanning for images ({', '.join(image_extensions)}) in: {batch_input_folder}")
+        image_extensions = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}; print(f"[File System][Batch] Scanning for images in: {batch_input_folder}")
         image_files = sorted([p for p in batch_input_folder.glob("*") if p.suffix.lower() in image_extensions])
+        if not image_files: raise gr.Error(f"No images found in: {batch_input_folder}")
+        total_files = len(image_files); print(f"[File System][Batch] Found {total_files} image file(s).")
 
-        if not image_files:
-            raise gr.Error(f"No images found in the batch input folder: {batch_input_folder}")
-
-        total_files = len(image_files)
-        print(f"[File System][Batch] Found {total_files} image file(s).")
-
-        # --- Validate other inputs (same as single generation) ---
-        # (Re-using validation logic from generate_video - consider refactoring later if needed)
-        try:
-             width = int(width); height = int(height)
-             if width <= 0 or width % 16 != 0: width = DEFAULT_WIDTH; gr.Warning(f"[Batch] Invalid width, using default {DEFAULT_WIDTH}")
-             if height <= 0 or height % 16 != 0: height = DEFAULT_HEIGHT; gr.Warning(f"[Batch] Invalid height, using default {DEFAULT_HEIGHT}")
-        except: width, height = DEFAULT_WIDTH, DEFAULT_HEIGHT; gr.Warning(f"[Batch] Invalid dims, using defaults")
-        try:
-             duration_seconds = float(duration_seconds); duration_seconds = max(1, min(duration_seconds, MAX_DURATION))
-        except: duration_seconds = DEFAULT_DURATION; gr.Warning(f"[Batch] Invalid duration, using default")
+        # --- Validate other inputs (re-using validation from generate_video) ---
+        try: width = int(width); height = int(height)
+        except: width, height = DEFAULT_WIDTH, DEFAULT_HEIGHT
+        if width <= 0 or width % 16 != 0: width = DEFAULT_WIDTH; gr.Warning(f"[Batch] Invalid width, using default {DEFAULT_WIDTH}")
+        if height <= 0 or height % 16 != 0: height = DEFAULT_HEIGHT; gr.Warning(f"[Batch] Invalid height, using default {DEFAULT_HEIGHT}")
+        try: duration_seconds = float(duration_seconds); duration_seconds = max(1, min(duration_seconds, MAX_DURATION))
+        except: duration_seconds = DEFAULT_DURATION; gr.Warning("[Batch] Invalid duration, using default")
         try: fps = int(fps); fps = max(1, fps)
-        except: fps = DEFAULT_FPS; gr.Warning(f"[Batch] Invalid FPS, using default")
+        except: fps = DEFAULT_FPS; gr.Warning("[Batch] Invalid FPS, using default")
         initial_seed = DEFAULT_SEED
         try: initial_seed = int(seed); initial_seed = max(0, initial_seed)
-        except: initial_seed = DEFAULT_SEED; gr.Warning(f"[Batch] Invalid seed, using default")
-
-        # <<< Added: Validate num_generations_input for batch >>>
-        try:
-             num_variations_per_image = int(num_generations_input)
-             if num_variations_per_image < 1:
-                  gr.Warning("[Batch] Number of Generations must be at least 1. Setting to 1.")
-                  num_variations_per_image = 1
-        except (ValueError, TypeError):
-             gr.Warning("[Batch] Invalid Number of Generations input. Setting to 1 variation per image.")
-             num_variations_per_image = 1
-        print(f"[Batch Config] Generating {num_variations_per_image} variation(s) per image.")
-        # <<< End Added >>>
+        except: initial_seed = DEFAULT_SEED; gr.Warning("[Batch] Invalid seed, using default")
+        try: num_variations_per_image = int(num_generations_input); num_variations_per_image = max(1, num_variations_per_image)
+        except: num_variations_per_image = 1; gr.Warning("[Batch] Invalid num variations, using 1")
+        print(f"[Batch Config] Generating {num_variations_per_image} variation(s) per image prompt.")
 
         # --- Model Loading / Reloading Check (same as single generation) ---
-        progress(0.1, desc="Checking model status...")
+        progress(0.05, desc="Checking model status...") # Slightly earlier
         num_persistent_param_in_dit = parse_persistent_params(vram_custom_value_input_param)
         torch_dtype = get_torch_dtype(torch_dtype_str)
 
@@ -1005,281 +881,221 @@ def process_batch(
 
         if load_needed:
             print("[Model Loading][Batch] Unloading/Reloading models...")
-            pipe, fantasytalking, wav2vec_processor, wav2vec = None, None, None, None; models_loaded = False
-            torch.cuda.empty_cache()
-            progress(0.15, desc="Loading models for batch...")
+            pipe, fantasytalking, wav2vec_processor, wav2vec = None, None, None, None; models_loaded = False; torch.cuda.empty_cache()
+            progress(0.1, desc="Loading models for batch...") # Adjusted progress
             try:
                 pipe, fantasytalking, wav2vec_processor, wav2vec = load_models(MODEL_DIRS["wan_model_dir"], MODEL_DIRS["fantasytalking_model_path"], MODEL_DIRS["wav2vec_model_dir"], num_persistent_param_in_dit, torch_dtype, "cuda")
                 models_loaded = True; current_torch_dtype = torch_dtype; current_num_persistent_param_in_dit = num_persistent_param_in_dit
                 print("[Model Loading][Batch] Models loaded.")
             except Exception as e: print(f"[Error][Batch] CRITICAL ERROR loading models: {e}"); traceback.print_exc(); raise gr.Error(f"Failed to load models for batch. Error: {e}")
-        else:
-            print("[Model Check][Batch] Models ready.")
+        else: print("[Model Check][Batch] Models ready.")
 
-
-        # --- Batch Processing Loop ---
-        print(f"[Batch] Starting batch processing loop for {total_files} image(s)...")
-        cancel_fn = lambda: cancel_requested # Define cancel function
-
-        total_iterations = total_files * num_variations_per_image # <<< Updated total iterations for progress
+        # --- Batch Processing Loops ---
+        cancel_fn = lambda: cancel_requested
+        # Estimate total iterations (will be refined inside loop)
+        estimated_total_iterations = total_files * num_variations_per_image # Initial estimate
         current_iteration = 0
+        actual_total_iterations = 0 # Will calculate precisely
 
+        # Pre-calculate total iterations precisely
         for i, image_path in enumerate(image_files):
-            # --- Outer loop iterates through image files --- #
             image_stem = image_path.stem
-            print(f"\n--- Processing Batch Item {i + 1}/{total_files}: {image_path.name} ---")
+            # Determine prompt source text
+            potential_prompt_path = batch_input_folder / f"{image_stem}.txt"
+            prompt_to_parse = prompt_fallback # Start with fallback
+            if potential_prompt_path.exists():
+                 try: prompt_to_parse = potential_prompt_path.read_text(encoding='utf-8').strip()
+                 except Exception: pass # Keep fallback if read fails
+            elif not batch_use_gradio_prompt:
+                 prompt_to_parse = DEFAULT_PROMPT # Force default if fallback disabled
 
-            # --- Check cancellation before processing variations for this image --- #
-            if cancel_requested:
-                print(f"[Cancellation][Batch] Cancellation detected before processing item {i + 1}.")
-                gr.Warning("Batch processing cancelled by user.")
-                break
+            # Parse prompts based on mode
+            if enable_multi_line_prompts:
+                 prompt_lines = parse_prompts(prompt_to_parse)
+            else:
+                 prompt_lines = [prompt_to_parse if prompt_to_parse else DEFAULT_PROMPT]
+            actual_total_iterations += len(prompt_lines) * num_variations_per_image
+        print(f"[Batch][Prep] Calculated total iterations: {actual_total_iterations}")
 
-            # --- Find Corresponding Audio (Done once per image file) --- #
-            audio_file_to_use = None
-            audio_extensions = {".wav", ".mp3", ".flac"}
-            found_audio = False
+
+        print(f"[Batch] Starting batch processing loop for {total_files} image(s)...")
+        # Outer loop: Images
+        for i, image_path in enumerate(image_files):
+            image_stem = image_path.stem
+            item_log_prefix = f"[Batch Item {i + 1}/{total_files} ({image_path.name})]"
+            print(f"\n--- Processing {item_log_prefix} ---")
+
+            if cancel_requested: print(f"{item_log_prefix} Cancellation detected. Stopping batch."); break
+
+            # --- Find Audio (remains the same) ---
+            audio_file_to_use = None; audio_extensions = {".wav", ".mp3", ".flac"}; found_audio = False
             for ext in audio_extensions:
                  potential_audio_path = batch_input_folder / f"{image_stem}{ext}"
-                 if potential_audio_path.exists():
-                      audio_file_to_use = potential_audio_path.resolve().as_posix()
-                      print(f"[File Match][Batch] Found matching audio: {potential_audio_path.name}")
-                      found_audio = True
-                      break
+                 if potential_audio_path.exists(): audio_file_to_use = potential_audio_path.resolve().as_posix(); found_audio = True; break
             if not found_audio:
-                 if batch_use_gradio_audio and audio_input_fallback:
-                      audio_file_to_use = Path(audio_input_fallback).resolve().as_posix()
-                      print(f"[File Match][Batch] No matching audio found for '{image_stem}'. Using UI audio: {Path(audio_file_to_use).name}")
-                 else:
-                      print(f"[Error][Batch] No matching audio found for '{image_stem}' and UI fallback disabled or missing. Skipping.")
-                      gr.Warning(f"Skipping {image_path.name}: No matching audio found.")
-                      error_files_count += 1
-                      skipped_files_count += num_variations_per_image # <<< Skip all variations for this image
-                      current_iteration += num_variations_per_image # <<< Update progress iteration count
-                      continue # Skip this image entirely
+                 if batch_use_gradio_audio and audio_input_fallback: audio_file_to_use = Path(audio_input_fallback).resolve().as_posix()
+                 else: print(f"{item_log_prefix} No audio found/fallback disabled. Skipping."); error_files_count += 1; continue
 
-            # --- Find Corresponding Prompt (Done once per image file) --- #
-            prompt_to_use = prompt_fallback if prompt_fallback else DEFAULT_PROMPT # Default
-            prompt_source = "UI fallback or default"
+            # --- Find and Parse Prompts ---
             potential_prompt_path = batch_input_folder / f"{image_stem}.txt"
+            prompt_source_text = prompt_fallback # Start with fallback
+            prompt_source_desc = "UI fallback"
             if potential_prompt_path.exists():
                 try:
-                    with open(potential_prompt_path, 'r', encoding='utf-8') as f:
-                        prompt_to_use = f.read().strip()
-                        prompt_source = f"matched file ({potential_prompt_path.name})"
-                    print(f"[File Match][Batch] Found and read matching prompt: {potential_prompt_path.name}")
+                    prompt_source_text = potential_prompt_path.read_text(encoding='utf-8').strip()
+                    prompt_source_desc = f"file ({potential_prompt_path.name})"
+                    print(f"{item_log_prefix} Found matching prompt file.")
                 except Exception as e:
-                    print(f"[Warning][Batch] Found prompt file {potential_prompt_path.name} but failed to read: {e}. Using {prompt_source}.")
-                    gr.Warning(f"Error reading prompt file {potential_prompt_path.name}. Using fallback/default.")
+                    print(f"{item_log_prefix} Warning: Failed to read prompt file {potential_prompt_path.name}: {e}. Using {prompt_source_desc}.")
+                    gr.Warning(f"Error reading prompt file {potential_prompt_path.name}")
             elif not batch_use_gradio_prompt:
-                 prompt_source = "default (UI fallback disabled)"
-                 prompt_to_use = DEFAULT_PROMPT # Force default if fallback disabled
+                 prompt_source_text = DEFAULT_PROMPT # Force default if fallback disabled
+                 prompt_source_desc = "default (UI fallback disabled)"
 
-            print(f"[Prompt Info][Batch] Using prompt from: {prompt_source}")
+            if enable_multi_line_prompts:
+                prompt_lines = parse_prompts(prompt_source_text)
+                print(f"{item_log_prefix} Multi-line enabled. Parsed {len(prompt_lines)} prompt(s) from {prompt_source_desc}.")
+            else:
+                prompt_lines = [prompt_source_text if prompt_source_text else DEFAULT_PROMPT]
+                print(f"{item_log_prefix} Multi-line disabled. Using single prompt from {prompt_source_desc}.")
+            num_prompts = len(prompt_lines)
 
-
-            # --- Calculate Duration & Frames for this item (Done once per image file) --- #
+            # --- Calculate Duration & Frames (remains the same) ---
             current_target_duration = duration_seconds
-            try:
-                item_audio_duration = librosa.get_duration(filename=audio_file_to_use)
-                print(f"[Audio Info][Batch] Item '{image_stem}' audio duration: {item_audio_duration:.2f}s")
-                if item_audio_duration < duration_seconds:
-                    print(f"[Info][Batch] Item '{image_stem}' audio ({item_audio_duration:.2f}s) is shorter than requested max duration ({duration_seconds}s). Using audio duration.")
-                    current_target_duration = item_audio_duration
-                elif item_audio_duration <= 0:
-                     raise ValueError("Audio duration is zero or negative.")
-            except Exception as e:
-                 print(f"[Error][Batch] Failed to get duration for audio '{Path(audio_file_to_use).name}'. Skipping item '{image_stem}'. Error: {e}")
-                 gr.Warning(f"Skipping {image_path.name}: Error reading audio duration.")
-                 error_files_count += 1
-                 skipped_files_count += num_variations_per_image # <<< Skip all variations
-                 current_iteration += num_variations_per_image # <<< Update progress iteration count
-                 continue
+            try: item_audio_duration = librosa.get_duration(filename=audio_file_to_use); print(f"{item_log_prefix} Audio duration: {item_audio_duration:.2f}s")
+            except Exception as e: print(f"{item_log_prefix} Failed read duration for {Path(audio_file_to_use).name}. Skipping. Error: {e}"); error_files_count += 1; continue
+            if item_audio_duration < duration_seconds: current_target_duration = item_audio_duration
+            if item_audio_duration <= 0: print(f"{item_log_prefix} Audio duration <= 0. Skipping."); error_files_count += 1; continue
+            current_num_frames = calculate_frames(current_target_duration, fps); print(f"{item_log_prefix} Target duration: {current_target_duration:.2f}s, num_frames: {current_num_frames}")
+            if current_num_frames <= 1: print(f"{item_log_prefix} Calculated frames <= 1. Skipping."); error_files_count += 1; continue
 
-            current_num_frames = calculate_frames(current_target_duration, fps)
-            print(f"[Calculation][Batch] Item '{image_stem}' target duration: {current_target_duration:.2f}s, num_frames: {current_num_frames}")
-            if current_num_frames <= 1:
-                 print(f"[Error][Batch] Calculated frames for '{image_stem}' is {current_num_frames}. Too low. Skipping.")
-                 gr.Warning(f"Skipping {image_path.name}: Calculated frames too low ({current_num_frames}).")
-                 error_files_count += 1
-                 skipped_files_count += num_variations_per_image # <<< Skip all variations
-                 current_iteration += num_variations_per_image # <<< Update progress iteration count
-                 continue
 
-            # --- Inner loop for variations per image --- #
-            for j in range(num_variations_per_image):
-                variation_index = j + 1
-                current_iteration += 1 # <<< Increment overall progress iteration count
+            # Middle loop: Prompts
+            for p_idx, current_prompt in enumerate(prompt_lines):
+                prompt_index_for_args = p_idx + 1 if enable_multi_line_prompts and num_prompts > 1 else None
+                prompt_log_prefix = f"[P{p_idx + 1}/{num_prompts}]"
 
-                # --- Update Progress Description --- #
-                progress_desc = f"Image {i+1}/{total_files} ({image_path.name}), Variation {variation_index}/{num_variations_per_image}"
-                progress((current_iteration / total_iterations) * 0.8 + 0.15, desc=progress_desc) # Scale progress: 0.15 to 0.95
+                if cancel_requested: print(f"{item_log_prefix}{prompt_log_prefix} Cancellation detected. Stopping."); break # Break middle loop
 
-                # --- Cancellation Check (inside inner loop) --- #
-                if cancel_requested:
-                    print(f"[Cancellation][Batch] Cancellation detected during variation {variation_index} for item {i+1}.")
-                    gr.Warning("Batch processing cancelled by user.")
-                    # Set a flag to break outer loop after inner loop finishes
-                    cancel_requested = True # Ensure outer loop breaks too
-                    break # Break inner variation loop
+                # Inner loop: Variations
+                for j in range(num_variations_per_image):
+                    variation_index = j + 1 # 1-based variation index
+                    variation_log_prefix = f"[V{variation_index}/{num_variations_per_image}]"
+                    current_iteration += 1
 
-                # --- Skip Logic (Check specific output for this variation) --- #
-                output_video_suffix = f"_{variation_index:04d}" if num_variations_per_image > 1 else ""
-                output_video_path = batch_output_folder / f"{image_stem}{output_video_suffix}.mp4"
-                output_metadata_path = batch_output_folder / f"{image_stem}{output_video_suffix}.txt"
+                    progress_desc = f"Img {i+1}/{total_files}, Prompt {p_idx+1}/{num_prompts}, Var {variation_index}/{num_variations_per_image} ({current_iteration}/{actual_total_iterations})"
+                    progress(current_iteration / actual_total_iterations * 0.85 + 0.1, desc=progress_desc) # Scale progress: 0.1 to 0.95
 
-                if batch_skip_existing:
-                    video_exists = output_video_path.exists()
-                    metadata_exists = save_metadata and output_metadata_path.exists()
-                    if video_exists or metadata_exists:
-                        reason = []
-                        if video_exists: reason.append("video exists")
-                        if metadata_exists: reason.append("metadata exists")
-                        print(f"[Skip][Batch] Skipping variation {variation_index} for '{image_path.name}' because {' and '.join(reason)}.")
+                    if cancel_requested: print(f"{item_log_prefix}{prompt_log_prefix}{variation_log_prefix} Cancellation detected. Stopping."); break # Break inner loop
+
+                    # --- Skip Logic (incorporating prompt index) ---
+                    prompt_suffix = f"_prompt{prompt_index_for_args}" if prompt_index_for_args is not None else ""
+                    variation_suffix = f"_{variation_index:04d}" if num_variations_per_image > 1 else ""
+                    output_video_name = f"{image_stem}{prompt_suffix}{variation_suffix}.mp4"
+                    output_meta_name = f"{image_stem}{prompt_suffix}{variation_suffix}.txt"
+                    output_video_path = batch_output_folder / output_video_name
+                    output_metadata_path = batch_output_folder / output_meta_name
+
+                    if batch_skip_existing and (output_video_path.exists() or (save_metadata and output_metadata_path.exists())):
+                        print(f"{item_log_prefix}{prompt_log_prefix}{variation_log_prefix} Skipping '{output_video_name}' (already exists).")
                         skipped_files_count += 1
-                        continue # Skip to the next variation
+                        continue # Skip to next variation
 
-                # --- Determine Seed for this specific variation --- #
-                current_seed = 0
-                if use_random_seed:
-                    current_seed = random.randint(0, 2**32 - 1)
-                else:
-                    # Make seed unique based on image index AND variation index
-                    current_seed = initial_seed + i * num_variations_per_image + j
+                    # --- Determine Seed ---
+                    current_seed = 0
+                    if use_random_seed: current_seed = random.randint(0, 2**32 - 1)
+                    else: current_seed = initial_seed + i * num_prompts * num_variations_per_image + p_idx * num_variations_per_image + j
+                    print(f"{item_log_prefix}{prompt_log_prefix}{variation_log_prefix} Using seed: {current_seed}")
 
-                print(f"[Seed Info][Batch] Variation {variation_index} for '{image_stem}' using seed: {current_seed}")
+                    # --- Prepare Arguments for infer.main ---
+                    print(f"{item_log_prefix}{prompt_log_prefix}{variation_log_prefix} Preparing args for infer.main...")
+                    args_dict = {
+                        "image_path": image_path.resolve().as_posix(),
+                        "audio_path": audio_file_to_use,
+                        "prompt": current_prompt, # <<< Use current prompt line
+                        "negative_prompt": negative_prompt,
+                        "output_dir": str(batch_output_folder),
+                        "width": width, "height": height, "num_frames": current_num_frames, "fps": fps,
+                        "audio_weight": float(audio_weight), "prompt_cfg_scale": float(prompt_cfg_scale), "audio_cfg_scale": float(audio_cfg_scale),
+                        "inference_steps": int(inference_steps), "seed": current_seed,
+                        "tiled_vae": bool(tiled_vae),
+                        "tile_size_h": int(tile_size_h), "tile_size_w": int(tile_size_w),
+                        "tile_stride_h": int(tile_stride_h), "tile_stride_w": int(tile_stride_w),
+                        "sigma_shift": float(sigma_shift), "denoising_strength": float(denoising_strength),
+                        "save_video_quality": int(save_video_quality), "save_metadata": bool(save_metadata),
+                        # --- Control info for infer.py ---
+                        "generation_index": variation_index,        # Variation index (1-based)
+                        "total_generations": num_variations_per_image, # Total variations for this prompt/image combo
+                        "prompt_index": prompt_index_for_args,      # Prompt index for multi-line (1-based or None)
+                        "output_base_name": image_stem,          # Base name for infer.py naming
+                    }
 
-                # --- Prepare Arguments for infer.main --- #
-                print(f"[Args Prep][Batch] Preparing arguments for variation {variation_index} of item '{image_stem}'...")
-                args_dict = {
-                    "image_path": image_path.resolve().as_posix(),
-                    "audio_path": audio_file_to_use, # Already resolved path
-                    "prompt": prompt_to_use,
-                    "negative_prompt": negative_prompt,
-                    "output_dir": str(batch_output_folder), # Use batch output dir
-                    "width": width,
-                    "height": height,
-                    "num_frames": current_num_frames, # Use item-specific frame count
-                    "fps": fps,
-                    "audio_weight": float(audio_weight),
-                    "prompt_cfg_scale": float(prompt_cfg_scale),
-                    "audio_cfg_scale": float(audio_cfg_scale),
-                    "inference_steps": int(inference_steps),
-                    "seed": current_seed,
-                    "tiled_vae": bool(tiled_vae),
-                    "tile_size_h": int(tile_size_h), "tile_size_w": int(tile_size_w),
-                    "tile_stride_h": int(tile_stride_h), "tile_stride_w": int(tile_stride_w),
-                    "sigma_shift": float(sigma_shift),
-                    "denoising_strength": float(denoising_strength),
-                    "save_video_quality": int(save_video_quality),
-                    "save_metadata": bool(save_metadata),
-                    # --- Crucial change: Pass variation index and total variations --- #
-                    "generation_index": variation_index, # <<< Index of the current variation (1, 2, ...)
-                    "total_generations": num_variations_per_image, # <<< Total variations requested for this image
-                    # -------------------------------------------------------------- #
-                    "output_base_name": image_stem, # Pass image stem for infer.py to handle suffixing
-                }
+                    # --- Execute Generation ---
+                    exec_log_prefix = f"[Exec]{item_log_prefix}{prompt_log_prefix}{variation_log_prefix}"
+                    try:
+                        print(f"{exec_log_prefix} Calling infer.main for '{output_video_name}'...")
+                        last_output_path = main(args_dict, pipe, fantasytalking, wav2vec_processor, wav2vec, cancel_fn=cancel_fn, gradio_progress=progress)
+                        print(f"{exec_log_prefix} Successfully processed. Output: {last_output_path}")
+                        processed_files_count += 1
+                    except CancelledError as ce:
+                        print(f"{exec_log_prefix} Caught CancelledError: {ce}"); gr.Warning(f"Batch cancelled during {output_video_name}.")
+                        cancel_requested = True; break # Break inner loop
+                    except Exception as e:
+                        print(f"{exec_log_prefix} Failed: {e}"); traceback.print_exc()
+                        gr.Warning(f"Error processing {output_video_name}: {e}. Skipping.")
+                        error_files_count += 1; continue # Continue to next variation
 
-                # --- Execute Generation for Batch Item Variation --- #
-                try:
-                    print(f"[Execution][Batch] Calling infer.main for variation {variation_index} of '{image_stem}' with output_dir: '{args_dict['output_dir']}'")
-                    last_output_path = main(
-                        args_dict, pipe, fantasytalking, wav2vec_processor, wav2vec,
-                        cancel_fn=cancel_fn,
-                        gradio_progress=progress
-                    )
-                    print(f"[Execution][Batch] Successfully processed variation {variation_index} for '{image_stem}'. Output: {last_output_path}")
-                    processed_files_count += 1
-                except CancelledError as ce:
-                    print(f"[Cancellation][Batch] Caught CancelledError during variation {variation_index} for '{image_stem}': {ce}")
-                    gr.Warning(f"Batch processing cancelled by user during variation {variation_index} of image {i+1}.")
-                    cancel_requested = True # Ensure outer loop breaks
-                    break # Stop processing variations for this image
-                except Exception as e:
-                    print(f"[Error][Batch] Failed to process variation {variation_index} for '{image_stem}'. Error: {str(e)}")
-                    traceback.print_exc()
-                    gr.Warning(f"Error processing variation {variation_index} of {image_path.name}: {e}. Skipping.")
-                    error_files_count += 1
-                    # Clear cache potentially? Optional.
-                    # torch.cuda.empty_cache()
-                    continue # Continue to the next variation for this image
+                # --- End Inner (Variation) Loop ---
+                if cancel_requested: break # Break middle loop
 
-            # --- End of inner loop (variations) --- #
-            # If cancellation happened inside inner loop, break outer loop now
-            if cancel_requested:
-                break
-        # --- End of outer loop (image files) --- #
+            # --- End Middle (Prompt) Loop ---
+            if cancel_requested: break # Break outer loop
 
-        # --- Batch Loop Finished --- #
+        # --- Batch Loops Finished ---
         if not cancel_requested:
-             final_desc = f"Batch complete! Processed: {processed_files_count}, Skipped: {skipped_files_count}, Errors: {error_files_count}."
-             # Ensure progress bar reaches 100% even if counts are off due to skipping
+             final_desc = f"Batch complete! Processed: {processed_files_count}, Skipped: {skipped_files_count}, Errors: {error_files_count} (Total Iterations: {actual_total_iterations})."
              progress(1.0, desc=final_desc)
-             print(f"[Batch] Batch processing finished. Processed: {processed_files_count}, Skipped: {skipped_files_count}, Errors: {error_files_count}.")
+             print(f"[Batch] Batch finished. {final_desc}")
              gr.Info(final_desc)
         else:
              print("[Batch] Batch processing loop exited due to cancellation.")
              gr.Warning(f"Batch cancelled. Processed: {processed_files_count}, Skipped: {skipped_files_count}, Errors: {error_files_count} before cancel.")
 
-
-        # Return the path of the last successfully generated video in the batch
         return last_output_path
 
-    except gr.Error as gr_e:
-         print(f"[Gradio Error][Batch] {gr_e}")
-         return None
-    except Exception as e:
-         print(f"[Error][Batch] An unexpected error occurred in process_batch: {str(e)}")
-         traceback.print_exc()
-         gr.Error(f"An unexpected batch error occurred: {str(e)}")
-         return None
+    except gr.Error as gr_e: print(f"[Gradio Error][Batch] {gr_e}"); return None
+    except Exception as e: print(f"[Error][Batch] Unexpected error: {e}"); traceback.print_exc(); gr.Error(f"Unexpected batch error: {e}"); return None
     finally:
-        # --- Reset State ---
-        # *** ADDED DEBUG PRINTS ***
         print(f"[State Check] Entering FINALLY block for process_batch. Current state: is_generating={is_generating}, is_cancelling={is_cancelling}, cancel_requested={cancel_requested}")
-        is_generating = False
-        is_cancelling = False # Explicitly reset
-        cancel_requested = False # Explicitly reset
+        is_generating = False; is_cancelling = False; cancel_requested = False # Reset all flags
         print(f"[State Check] Exiting FINALLY block for process_batch. Flags after reset: is_generating={is_generating}, is_cancelling={is_cancelling}, cancel_requested={cancel_requested}")
-        # --- Unload models if cancelled? ---
-        # Decide if unloading here is appropriate or if it should only happen in generate_video's finally
-        # If process_batch is cancelled, maybe models should unload too.
-        # if cancel_requested and pipe is not None: # Check if cancel caused exit
-        #      print("[Cleanup][Batch] Attempting model unload after potentially cancelled batch...")
-        #      try: pipe.load_models_to_device([]); print("[Cleanup][Batch] Models unloaded.")
-        #      except Exception as ue: print(f"[Warning] Error unloading model post-batch-cancel: {ue}")
 
 
 # --- Cancel Handler ---
-# *** REFINED VERSION ***
 def handle_cancel():
     """Sets the cancellation flag and provides user feedback."""
-    global is_generating, is_cancelling, cancel_requested # Make sure all relevant globals are listed
+    global is_generating, is_cancelling, cancel_requested
 
-    # Check if we are actually running something OR if already cancelling
     if not is_generating or is_cancelling:
-        print("[Cancel Handler] No active generation/batch to cancel, or cancellation already in progress.")
-        # Optionally provide feedback, but avoid spamming if clicked repeatedly when idle
-        # gr.Info("Nothing to cancel or cancellation already requested.")
-        return # Do nothing if not generating or already cancelling
+        print("[Cancel Handler] No active task or already cancelling.")
+        return
 
-    print("[Cancel Handler] Cancel button clicked. Setting flags.")
-    cancel_requested = True # Signal the running function to stop
-    is_cancelling = True    # Set state to prevent new generations and repeated cancel signals
+    print("[Cancel Handler] Cancel requested. Setting flags.")
+    cancel_requested = True
+    is_cancelling = True # Prevent new runs & repeated cancels
+    # Don't reset is_generating here, the finally block of the running task will do it
     gr.Warning("Cancel requested! Attempting to stop generation...")
-    # Gradio's `cancels` mechanism will now try to interrupt the target function.
-    # The finally block in the main functions will reset is_cancelling and is_generating later.
 
 
 # --- Gradio UI Definition ---
-with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V1)", theme=gr.themes.Soft()) as demo:
+with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V9.1)", theme=gr.themes.Soft()) as demo: # Updated title
     gr.Markdown(
         """
-    # FantasyTalking: Realistic Talking Portrait Generation SECourses App V9 - https://www.patreon.com/posts/127855145
-    Generate a talking head video from an image and audio, or process a batch of images.
-    [GitHub](https://github.com/Fantasy-AMAP/fantasy-talking) | [arXiv Paper](https://arxiv.org/abs/2504.04842)
+    # FantasyTalking: Realistic Talking Portrait Generation SECourses App V10 - Multi-Prompt Update
+    Generate a talking head video from an image and audio, or process a batch of images. Supports multiple prompts per generation.
+    [GitHub](https://github.com/Fantasy-AMAP/fantasy-talking) | [arXiv Paper](https://arxiv.org/abs/2504.04842) | [Patreon Post](https://www.patreon.com/posts/127855145)
     """
-    )
+    ) # Updated description slightly
 
     with gr.Row():
         # --- Left Column: Inputs & Basic Settings ---
@@ -1287,10 +1103,8 @@ with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V1)", theme
             gr.Markdown("## 1. Inputs (Single Generation)")
             with gr.Row():
                 image_input = gr.Image(label="Input Image", type="filepath", scale=1)
-                # audio_input = gr.File(label="Input Audio or Video", file_types=["audio", ".wav", ".mp3", ".flac", "video", ".mp4", ".mov", ".avi", ".mkv"], type="filepath", scale=1)
                 audio_input = gr.Audio(label="Input Audio (WAV/MP3)", type="filepath", scale=1) # Reverted to gr.Audio
 
-            # Add a separate input for video uploads
             video_audio_input = gr.File(
                 label="Or Upload Video to Extract Audio",
                 file_types=["video", ".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv"],
@@ -1298,78 +1112,73 @@ with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V1)", theme
             )
 
             prompt_input = gr.Textbox(
-                label="Prompt", placeholder=DEFAULT_PROMPT, value=DEFAULT_PROMPT, lines=5,
-                info="Describe the scene/action. Used for single gen or batch fallback."
+                label="Prompt(s)", placeholder=DEFAULT_PROMPT, value=DEFAULT_PROMPT, lines=5,
+                info="Enter one prompt per line. Enable checkbox below to process each line separately." # Updated info
             )
+            # <<< Added Multi-Line Checkbox >>>
+            enable_multi_line_prompts_checkbox = gr.Checkbox(
+                label="Enable Multi-Line Prompts",
+                value=False, # Default is off
+                info="If checked, each line in the Prompt(s) box above (min 2 chars) will generate a separate video sequence."
+            )
+            # <<< End Added >>>
+
             negative_prompt_input = gr.Textbox(
                 label="Negative Prompt", placeholder=DEFAULT_NEGATIVE_PROMPT, value=DEFAULT_NEGATIVE_PROMPT, lines=2,
-                info="Describe what NOT to generate. Used for single and batch."
+                info="Describe what NOT to generate. Applied to all prompts." # Clarified scope
             )
             with gr.Row():
                 torch_dtype_dropdown = gr.Dropdown(
-                        choices=list(TORCH_DTYPES_STR.keys()), value=TORCH_DTYPE_DEFAULT, label="Model Loading Precision (BF16 Highest Quality, more RAM and VRAM), FP8 Lower Quality but lower RAM and VRAM",
-                        info="BF16 is recommended. But if you get errors due to limited RAM or VRAM use FP8. Requires model reload on change."
+                        choices=list(TORCH_DTYPES_STR.keys()), value=TORCH_DTYPE_DEFAULT, label="Model Loading Precision", # Shortened label
+                        info="BF16=Quality/RAM/VRAM+, FP8=Quality-/RAM/VRAM-. Needs reload." # Shortened info
                     )
-                tiled_vae_checkbox = gr.Checkbox(label="Enable Tiled VAE", value=True, info="Saves VRAM during decode, might be slightly slower.")
+                tiled_vae_checkbox = gr.Checkbox(label="Enable Tiled VAE", value=True, info="Saves VRAM during decode, may be slower.")
 
             gr.Examples(
                 examples=[
-                    ["assets/images/man.png", "assets/audios/man.wav", "A person speaking animatedly, using expressive hand gestures and nodding their head, medium shot."]
+                    ["assets/images/man.png", "assets/audios/man.wav", "A person speaking animatedly, using expressive hand gestures and nodding their head, medium shot."] # Example with multi-line
                 ],
                 inputs=[image_input, audio_input, prompt_input],
-                label="Examples (Image, Audio, Prompt)"
+                label="Examples (Image, Audio, Prompt(s))" # Updated label
             )
 
             gr.Markdown("## 2. Generation Settings")
             with gr.Row():
-                 width_input = gr.Number(value=DEFAULT_WIDTH, label="Width", minimum=64, step=16, precision=0, info="Must be divisible by 16")
-                 height_input = gr.Number(value=DEFAULT_HEIGHT, label="Height", minimum=64, step=16, precision=0, info="Must be divisible by 16")
+                 width_input = gr.Number(value=DEFAULT_WIDTH, label="Width", minimum=64, step=16, precision=0, info="/ 16") # Shortened info
+                 height_input = gr.Number(value=DEFAULT_HEIGHT, label="Height", minimum=64, step=16, precision=0, info="/ 16") # Shortened info
             with gr.Row():
-                duration_input = gr.Number(value=DEFAULT_DURATION, minimum=1, maximum=MAX_DURATION, label="Max Duration (s)", info=f"Video length (capped by audio, max {MAX_DURATION}s)")
+                duration_input = gr.Number(value=DEFAULT_DURATION, minimum=1, maximum=MAX_DURATION, label="Max Duration (s)", info=f"<= audio, max {MAX_DURATION}s") # Shortened info
                 fps_input = gr.Number(value=DEFAULT_FPS, minimum=1, maximum=60, label="FPS", precision=0)
 
-            num_generations_input = gr.Number(label="Number of Generations (Both Single and Batch Gens)", value=1, minimum=1, step=1, precision=0, info="Generate multiple sequential videos with varying seeds.")
+            num_generations_input = gr.Number(label="Number of Generations per Prompt", value=1, minimum=1, step=1, precision=0, info="Number of videos per prompt line (uses different seeds).") # Updated label/info
 
             with gr.Row():
                 prompt_cfg_scale = gr.Slider(minimum=1.0, maximum=15.0, value=DEFAULT_PROMPT_CFG, step=0.5, label="Prompt CFG")
                 audio_cfg_scale = gr.Slider(minimum=1.0, maximum=15.0, value=DEFAULT_AUDIO_CFG, step=0.5, label="Audio CFG")
             with gr.Row():
-                audio_weight = gr.Slider(minimum=0.1, maximum=3.0, value=DEFAULT_AUDIO_WEIGHT, step=0.1, label="Audio Weight", info="Overall audio influence strength.")
+                audio_weight = gr.Slider(minimum=0.1, maximum=3.0, value=DEFAULT_AUDIO_WEIGHT, step=0.1, label="Audio Weight", info="Audio influence.") # Shortened info
                 inference_steps = gr.Slider(minimum=1, maximum=100, value=DEFAULT_INFERENCE_STEPS, step=1, label="Inference Steps")
 
             with gr.Row():
-                seed_input = gr.Number(value=DEFAULT_SEED, label="Seed", minimum=-1, precision=0, info="-1 for default")
-                random_seed_checkbox = gr.Checkbox(label="Use Random Seed", value=False, info="Overrides Seed if checked.")
+                seed_input = gr.Number(value=DEFAULT_SEED, label="Seed", minimum=-1, precision=0, info="-1 default")
+                random_seed_checkbox = gr.Checkbox(label="Use Random Seed", value=False, info="Overrides Seed.")
 
             with gr.Accordion("Advanced Settings", open=True):
                 with gr.Row():
-                    sigma_shift = gr.Slider(minimum=0.1, maximum=10.0, value=DEFAULT_SIGMA_SHIFT, step=0.1, label="Sigma Shift (Scheduler)")
-                    denoising_strength = gr.Slider(minimum=0.1, maximum=1.0, value=DEFAULT_DENOISING_STRENGTH, step=0.05, label="Denoising Strength", info="Usually 1.0 for I2V from image.")
+                    sigma_shift = gr.Slider(minimum=0.1, maximum=10.0, value=DEFAULT_SIGMA_SHIFT, step=0.1, label="Sigma Shift")
+                    denoising_strength = gr.Slider(minimum=0.1, maximum=1.0, value=DEFAULT_DENOISING_STRENGTH, step=0.05, label="Denoising Strength", info="Usually 1.0 for I2V.")
                 with gr.Row():
-                    save_video_quality = gr.Slider(minimum=0, maximum=51, value=DEFAULT_SAVE_QUALITY, step=1, label="Output Quality (CRF)", info="Lower CRF = higher quality (0=lossless, ~18=good, 23=default, 51=worst).")
-                    save_metadata_checkbox = gr.Checkbox(label="Save Generation Metadata (.txt)", value=True, info="Save settings, timings, filenames.")
+                    save_video_quality = gr.Slider(minimum=0, maximum=51, value=DEFAULT_SAVE_QUALITY, step=1, label="Output Quality (CRF)", info="Lower=Higher quality (0=lossless).") # Simplified info
+                    save_metadata_checkbox = gr.Checkbox(label="Save Metadata (.txt)", value=True, info="Save settings, timings.")
 
             with gr.Accordion("Performance & VRAM", open=True):
-                gr.Markdown("_Higher resolution/duration needs more VRAM. Precision affects speed/VRAM._")
-                # VRAM Preset Dropdown (Helper)
+                gr.Markdown("_Higher resolution/duration needs more VRAM._")
                 with gr.Row():
-                    vram_preset_dropdown = gr.Dropdown(
-                        choices=list(VRAM_PRESETS.keys()),
-                        value=VRAM_PRESET_DEFAULT,
-                        label="VRAM Usage Preset Helper",
-                        info="Select a preset to auto-fill the value below."
-                    )
-                    # Actual VRAM Value Input (Textbox)
-                    vram_custom_value_input = gr.Textbox(
-                        label="Persistent Params Value",
-                        value=VRAM_PRESETS[VRAM_PRESET_DEFAULT],
-                        info="Effective value (number of parameters kept in VRAM). 0 is slowest bust least VRAM usage. Values are set for 512px and 5 sec vidoes. More seconds = more VRAM demanding, more resolution = more VRAM demanding"
-                     )
-                # Link dropdown to textbox update
+                    vram_preset_dropdown = gr.Dropdown(choices=list(VRAM_PRESETS.keys()), value=VRAM_PRESET_DEFAULT, label="VRAM Preset Helper")
+                    vram_custom_value_input = gr.Textbox(label="Persistent Params Value", value=VRAM_PRESETS[VRAM_PRESET_DEFAULT], info="Params in VRAM. 0=Least VRAM/Slowest. Adjust for resolution/duration.") # Simplified info
                 vram_preset_dropdown.change(fn=update_vram_textbox, inputs=vram_preset_dropdown, outputs=vram_custom_value_input)
 
-                with gr.Group(visible=True) as tile_options: # Keep tile options always visible but respect checkbox
-                    # Tiling options enabled/disabled based on checkbox in backend logic
+                with gr.Group(visible=True) as tile_options:
                     with gr.Row():
                         tile_size_h_input = gr.Number(value=DEFAULT_TILE_SIZE_H, label="Tile H", precision=0)
                         tile_size_w_input = gr.Number(value=DEFAULT_TILE_SIZE_W, label="Tile W", precision=0)
@@ -1382,167 +1191,120 @@ with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V1)", theme
         with gr.Column(scale=1):
             gr.Markdown("## 3. Execution & Output")
             with gr.Row():
-                process_btn = gr.Button("Generate Single Video", variant="primary", scale=2)
-                cancel_btn = gr.Button("Cancel All", variant="stop", scale=1) # Single cancel button
-            video_output = gr.Video(label="Generated Video Output")
+                process_btn = gr.Button("Generate Video(s)", variant="primary", scale=2) # Renamed button slightly
+                cancel_btn = gr.Button("Cancel All", variant="stop", scale=1)
+            video_output = gr.Video(label="Last Generated Video Output") # Clarified label
             open_folder_btn = gr.Button("Open Outputs Folder")
 
             with gr.Accordion("Batch Processing", open=True):
                  gr.Markdown(
                      """
-                     Process multiple images from a folder. It looks for matching audio (`<name>.wav/mp3`)
-                     and prompts (`<name>.txt`) in the *same folder* as the images.
-                     Uses UI settings as defaults or fallbacks if enabled.
-                     """
+                     Process images from a folder. Looks for matching audio (`<name>.[wav|mp3|flac]`)
+                     and prompts (`<name>.txt`) in the *input folder*. If 'Enable Multi-Line Prompts' is checked,
+                     each line in the `.txt` file (or UI fallback prompt) will be processed. Uses UI settings as defaults.
+                     """ # Updated description
                  )
-                 batch_input_folder_input = gr.Textbox(label="Batch Input Folder (contains images, audios, txts)", placeholder="/path/to/your/inputs")
-                 batch_output_folder_input = gr.Textbox(label="Batch Output Folder (where videos are saved)", placeholder="/path/to/your/outputs", value=str(OUTPUT_DIR)) # Default to main output dir
+                 batch_input_folder_input = gr.Textbox(label="Batch Input Folder", placeholder="/path/to/your/inputs")
+                 batch_output_folder_input = gr.Textbox(label="Batch Output Folder", placeholder="/path/to/your/outputs", value=str(OUTPUT_DIR))
                  with gr.Row():
-                      batch_skip_existing_checkbox = gr.Checkbox(label="Skip if Output Exists", value=True)
-                      batch_use_gradio_audio_checkbox = gr.Checkbox(label="Use UI Audio if match not found", value=True)
-                      batch_use_gradio_prompt_checkbox = gr.Checkbox(label="Use UI Prompt if match not found", value=True)
+                      batch_skip_existing_checkbox = gr.Checkbox(label="Skip Existing", value=True) # Shortened
+                      batch_use_gradio_audio_checkbox = gr.Checkbox(label="Use UI Audio Fallback", value=True) # Shortened
+                      batch_use_gradio_prompt_checkbox = gr.Checkbox(label="Use UI Prompt Fallback", value=True) # Shortened
 
                  batch_start_btn = gr.Button("Start Batch Process", variant="primary")
-                 # Cancel button is shared
-
 
             # --- Presets Section ---
-            with gr.Group(): # Group preset elements visually
+            with gr.Group():
                 gr.Markdown("## 4. Presets")
                 initial_presets = get_preset_files()
-                # --- MODIFIED ---
-                # last_used_preset = get_latest_preset_name() # Removed
-                initial_preset_name = load_last_used_preset() # Load persistent setting
-                preset_dropdown = gr.Dropdown(
-                    choices=initial_presets,
-                    # value=last_used_preset, # Use loaded initial name
-                    value=initial_preset_name,
-                    label="Load Preset",
-                    info="Select a preset to load its settings."
-                )
-                # --- END MODIFIED ---
+                initial_preset_name = load_last_used_preset()
+                preset_dropdown = gr.Dropdown(choices=initial_presets, value=initial_preset_name, label="Load Preset") # Simplified
                 with gr.Row():
-                    preset_name_input = gr.Textbox(label="Save Preset As", placeholder="Enter new preset name...")
+                    preset_name_input = gr.Textbox(label="Save Preset As", placeholder="Enter preset name...")
                     save_preset_btn = gr.Button("Save Current Settings")
-            # --- End Presets Section ---
 
     # --- Event Handling ---
 
     # Single Generation Button
-    gen_event = process_btn.click(
-        fn=generate_video,
-        inputs=[
-            image_input, audio_input, prompt_input, negative_prompt_input,
+    gen_inputs = [
+            image_input, audio_input, prompt_input,
+            enable_multi_line_prompts_checkbox, # <<< Added
+            negative_prompt_input,
             width_input, height_input, duration_input, fps_input, num_generations_input,
             prompt_cfg_scale, audio_cfg_scale, audio_weight,
             inference_steps, seed_input, random_seed_checkbox,
             sigma_shift, denoising_strength, save_video_quality, save_metadata_checkbox,
             tiled_vae_checkbox, tile_size_h_input, tile_size_w_input, tile_stride_h_input, tile_stride_w_input,
-            vram_custom_value_input, # Use the textbox value
+            vram_custom_value_input,
             torch_dtype_dropdown,
-        ],
-        outputs=video_output,
-    )
+        ]
+    gen_event = process_btn.click(fn=generate_video, inputs=gen_inputs, outputs=video_output)
 
     # Batch Generation Button
-    batch_event = batch_start_btn.click(
-         fn=process_batch,
-         inputs=[
-              # Batch specific
+    batch_inputs = [
               batch_input_folder_input, batch_output_folder_input,
               batch_skip_existing_checkbox, batch_use_gradio_audio_checkbox, batch_use_gradio_prompt_checkbox,
-              # Fallbacks / General Settings from UI
-              image_input, audio_input, prompt_input, negative_prompt_input,
+              image_input, audio_input, prompt_input,
+              enable_multi_line_prompts_checkbox, # <<< Added
+              negative_prompt_input,
               width_input, height_input, duration_input, fps_input,
-              num_generations_input, # <<< Added: Get number of variations per image
+              num_generations_input,
               prompt_cfg_scale, audio_cfg_scale, audio_weight,
               inference_steps, seed_input, random_seed_checkbox,
               sigma_shift, denoising_strength, save_video_quality, save_metadata_checkbox,
               tiled_vae_checkbox, tile_size_h_input, tile_size_w_input, tile_stride_h_input, tile_stride_w_input,
-              vram_custom_value_input, # Use the textbox value
+              vram_custom_value_input,
               torch_dtype_dropdown,
-         ],
-         outputs=video_output # Show last generated batch video
-    )
+         ]
+    batch_event = batch_start_btn.click(fn=process_batch, inputs=batch_inputs, outputs=video_output)
 
     # --- Populate the Component List for Presets ---
-    # This MUST come AFTER all the components listed in SETTING_COMPONENTS_VARS are defined.
-    # Ensure the order here EXACTLY matches the order in SETTING_COMPONENTS_VARS.
+    # Ensure order matches SETTING_COMPONENTS_VARS
     SETTING_COMPONENTS = [
-        # Left Column
-        prompt_input, negative_prompt_input,
+        prompt_input,
+        enable_multi_line_prompts_checkbox, # <<< Added
+        negative_prompt_input,
         torch_dtype_dropdown, tiled_vae_checkbox,
         width_input, height_input, duration_input, fps_input, num_generations_input,
         prompt_cfg_scale, audio_cfg_scale, audio_weight,
         inference_steps, seed_input, random_seed_checkbox,
         sigma_shift, denoising_strength, save_video_quality, save_metadata_checkbox,
-        vram_preset_dropdown, vram_custom_value_input, # Include both VRAM controls
+        vram_preset_dropdown, vram_custom_value_input,
         tile_size_h_input, tile_size_w_input, tile_stride_h_input, tile_stride_w_input,
-        # Batch Tab (Add corresponding variables if included in VARS list)
-        # batch_input_folder_input, batch_output_folder_input,
-        # batch_skip_existing_checkbox, batch_use_gradio_audio_checkbox, batch_use_gradio_prompt_checkbox,
     ]
-    # Now link the global variable inside the functions to this list's variable names
-    # (This seems redundant, let's modify save/load to directly use SETTING_COMPONENTS_VARS)
-    # We already defined SETTING_COMPONENTS_VARS globally. Save/Load will use that.
 
     # --- Preset Event Handling ---
-    save_preset_btn.click(
-        fn=save_preset,
-        # Input the name first, then unpack all component values
-        inputs=[preset_name_input] + SETTING_COMPONENTS,
-        # Output updates the preset dropdown
-        outputs=[preset_dropdown]
-    )
-
-    # Load preset when dropdown changes OR when explicitly loaded (if we add a load button)
-    # For simplicity, we'll just load when the dropdown changes.
-    preset_dropdown.change(
-        fn=load_preset,
-        inputs=[preset_dropdown],
-        # Outputs is the list of components to update
-        outputs=SETTING_COMPONENTS
-    )
+    save_preset_btn.click(fn=save_preset, inputs=[preset_name_input] + SETTING_COMPONENTS, outputs=[preset_dropdown])
+    preset_dropdown.change(fn=load_preset, inputs=[preset_dropdown], outputs=SETTING_COMPONENTS)
 
     # Universal Cancel Button
-    # It calls the handle_cancel function *immediately* to set flags
-    # And uses `cancels` to signal Gradio to interrupt the running events
-    cancel_btn.click(
-        fn=handle_cancel,        # Function to set flags and give feedback
-        inputs=None,             # No inputs needed for cancel handler
-        outputs=None            # No direct output from cancel handler
-        # Removed cancels=[gen_event, batch_event]
-    )
+    cancel_btn.click(fn=handle_cancel, inputs=None, outputs=None) # Removed cancels= list
 
     # Connect Video Upload to Audio Extraction and Update Audio Input
-    video_audio_input.upload(
-        fn=handle_video_upload,
-        inputs=[video_audio_input],
-        outputs=[audio_input] # Update the main audio input
-    )
+    video_audio_input.upload(fn=handle_video_upload, inputs=[video_audio_input], outputs=[audio_input])
 
     # Open Output Folder Button
     open_folder_btn.click(fn=open_folder, inputs=None, outputs=None)
 
-    # --- NEW: Function to Apply Initial Settings on App Load ---
+    # --- Apply Initial Settings on App Load ---
     def apply_initial_settings():
-        """Loads the last used preset when the app starts."""
         preset_to_load = load_last_used_preset()
-        print(f"[Startup] Attempting to apply initial preset: {preset_to_load}")
+        print(f"[Startup] Applying initial preset: {preset_to_load}")
         try:
-            # load_preset now returns the list of updates for SETTING_COMPONENTS
+            # <<< Ensure list has correct length even on error >>>
             updates = load_preset(preset_to_load)
+            if len(updates) != len(SETTING_COMPONENTS):
+                 print(f"[Error][Startup] Incorrect number of updates returned by load_preset ({len(updates)} vs {len(SETTING_COMPONENTS)}). Using defaults.")
+                 return [None] * len(SETTING_COMPONENTS)
             print(f"[Startup] Successfully applied initial preset: {preset_to_load}")
             return updates
         except Exception as e:
             print(f"[Error][Startup] Failed during initial preset application for '{preset_to_load}': {e}")
-            # Return list of Nones to avoid errors, UI keeps defaults
             return [None] * len(SETTING_COMPONENTS)
 
-    # --- NEW: Trigger the initial preset load ---
     demo.load(apply_initial_settings, inputs=None, outputs=SETTING_COMPONENTS)
-    # ----------------------------------------------
 
+# --- Utility Functions (No changes needed) ---
 def get_available_drives():
     """Detect available drives on the system regardless of OS"""
     available_paths = []
@@ -1559,7 +1321,6 @@ def get_available_drives():
          available_paths = ["/", "/Volumes"]
     else:
         available_paths = ["/", "/mnt", "/media"]
-
     existing_paths = [p for p in available_paths if os.path.exists(p)]
     print(f"Allowed Gradio paths: {existing_paths}")
     return existing_paths
@@ -1569,19 +1330,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--share", action="store_true", help="Enable Gradio sharing")
     args, unknown = parser.parse_known_args()
-
     share_flag = args.share
 
-    # --- Initialize Presets ---
     create_default_preset_if_missing()
-    # (Initial preset list and selection are handled inside gr.Blocks now)
-    # --- Load last used preset name is handled by dropdown init and demo.load ---
-
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    TEMP_AUDIO_DIR.mkdir(parents=True, exist_ok=True) # Create temp audio dir
+    TEMP_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
     print(f"Output directory: {OUTPUT_DIR.resolve()}")
-    print(f"Temporary audio directory: {TEMP_AUDIO_DIR.resolve()}") # Log temp dir
+    print(f"Temporary audio directory: {TEMP_AUDIO_DIR.resolve()}")
 
-    demo.launch(inbrowser=True, share=share_flag,allowed_paths=get_available_drives()) # Added server_name for listen
-
-# --- END OF FILE secourses_app.py ---
+    demo.launch(inbrowser=True, share=share_flag, allowed_paths=get_available_drives())

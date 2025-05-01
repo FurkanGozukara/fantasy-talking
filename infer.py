@@ -1,5 +1,3 @@
-# --- START OF FILE infer.py ---
-
 # Copyright Alibaba Inc. All Rights Reserved.
 
 import os
@@ -11,6 +9,7 @@ import json # For metadata saving and potentially prompt loading
 import pprint # For pretty printing dicts
 import traceback # For detailed error logging
 import shutil # <<< Added for file copying
+import re # <<< Added for regex in sequential naming
 
 # import cv2 # No longer needed directly here
 import librosa # Keep for checking audio duration before processing
@@ -74,7 +73,7 @@ def load_models(
 
     if target_pipeline_dtype in [torch.bfloat16, torch.float16]:
         wan_model_filename = "wan21_i2v_720p_14B_fp16.safetensors"
-        wan_loading_dtype = torch_dtype
+        wan_loading_dtype = torch.bfloat16
         print(f"[Model Loading] Selected Wan I2V model for BF16/FP16 pipeline: {wan_model_filename} (loading as {torch_dtype})")
     elif target_pipeline_dtype == torch.float8_e4m3fn:
         wan_model_filename = "wan21_i2v_720p_14B_fp8_e4m3fn.safetensors"
@@ -84,7 +83,7 @@ def load_models(
         # Fallback or error - defaulting to FP8 might be risky, but let's match previous behavior slightly safer
         print(f"[Warning][Model Loading] Unsupported torch_dtype ({target_pipeline_dtype}) received. Defaulting to FP8 model. Behavior might be unexpected.")
         wan_model_filename = "wan21_i2v_720p_14B_fp8_e4m3fn.safetensors"
-        wan_loading_dtype = torch.float16
+        wan_loading_dtype = torch.bfloat16
 
     if not wan_model_filename or not wan_loading_dtype:
          # This should ideally not happen with the fallback, but good practice
@@ -114,14 +113,11 @@ def load_models(
     print("[Model Loading] Wan I2V models loaded to CPU.")
     print("[Model Loading] Creating WanVideoPipeline...")
     try:
-        if target_pipeline_dtype is torch.bfloat16:
-            pipe = WanVideoPipeline.from_model_manager(
-                model_manager, torch_dtype=torch.bfloat16, device=device  # Pipeline manages device movement
-            )
-        else:
-            pipe = WanVideoPipeline.from_model_manager(
-                model_manager, torch_dtype=torch.float16, device=device  # Pipeline manages device movement
-            )
+        # <<< Simplified pipeline creation, dtype handled by from_model_manager logic internally now >>>
+        # (Assuming diffsynth >= 0.0.17 where device/dtype handled more directly)
+        pipe = WanVideoPipeline.from_model_manager(
+            model_manager, torch_dtype=target_pipeline_dtype, device=device
+        )
     except Exception as e:
         print(f"[Error][Model Loading] Failed to create WanVideoPipeline.")
         print(f"[Error][Model Loading] Details: {e}")
@@ -191,11 +187,16 @@ def main(
     start_time_global = datetime.now() # Record overall start time
     start_time_perf = time.perf_counter() # More precise timer
 
-    # --- Get Generation Index/Total for Logging ---
+    # --- Get Generation Index/Total and Prompt Index for Logging ---
     # Use .get() with defaults for safety
-    generation_index = args.get('generation_index', 1)
-    total_generations = args.get('total_generations', 1)
+    generation_index = args.get('generation_index', 1) # Variation index
+    total_generations = args.get('total_generations', 1) # Total variations for this prompt
+    prompt_index = args.get('prompt_index') # Prompt index (1-based or None) <<< Added
+
     log_prefix = f"[Gen {generation_index}/{total_generations}]"
+    if prompt_index is not None:
+        log_prefix += f"[Prompt {prompt_index}]" # <<< Add prompt index to log prefix
+
     print(f"\n{log_prefix} ===== Starting Generation Task =====")
     print(f"{log_prefix} Start time: {start_time_global.strftime('%Y-%m-%d %H:%M:%S')}")
 
@@ -221,46 +222,69 @@ def main(
         output_dir = Path(output_dir_str)
         output_dir.mkdir(parents=True, exist_ok=True)
         print(f"{log_prefix} Ensured output directory exists: {output_dir}")
-        # --- Ensure Used Audios Directory Exists --- #
         USED_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
         print(f"{log_prefix} Ensured used audios directory exists: {USED_AUDIO_DIR}")
-        # ----------------------------------------- #
 
-        # Filenaming strategy depends on 'output_base_name'
-        output_base_name_arg = args.get('output_base_name') # For batch mode override
-        save_metadata = args.get('save_metadata', False) # Check if metadata saving is enabled
-        # Get generation index info early for naming (still needed for logging and suffix)
-        generation_index = args.get('generation_index', 1)
-        total_generations = args.get('total_generations', 1) # Used for batch suffix logic
+        # Filenaming strategy depends on 'output_base_name' (batch mode) or sequential counter
+        output_base_name_arg = args.get('output_base_name') # For batch mode override stem
+        save_metadata = args.get('save_metadata', False)
+        # Indices already retrieved above for logging
 
-        # Initialize path variables - will be fully defined later
+        # Initialize path variables
         base_name = None
-        base_name_with_gen = None
+        base_name_with_suffixes = None # <<< Renamed for clarity
         save_path = None
         metadata_path = None
         save_path_tmp = None
         used_audio_filename = None
         saved_audio_path_str = None
 
+        # Define suffixes based on indices
+        prompt_suffix = f"_prompt{prompt_index}" if prompt_index is not None else ""
+        variation_suffix = f"_{generation_index:04d}" if total_generations > 1 else ""
+
         if output_base_name_arg:
-            # Batch mode: Determine base name early using the provided stem.
-            # Suffix is added based on variation count for the *item*.
-            base_name = output_base_name_arg # The core stem
-            total_variations_for_item = total_generations # In batch, total_generations IS the variation count for the item
-            current_variation_index = generation_index # In batch, generation_index IS the variation index
+            # Batch mode: Base name is provided stem. Combine with suffixes.
+            base_name = output_base_name_arg # The core stem from image filename
+            base_name_with_suffixes = f"{base_name}{prompt_suffix}{variation_suffix}"
+            print(f"{log_prefix} Batch mode: Determined base name with suffixes: {base_name_with_suffixes}")
+        else:
+            # Single/Sequential mode: Find the NEXT available 4-digit prefix.
+            print(f"{log_prefix} Sequential mode: Scanning for highest existing sequence number in {output_dir}...")
+            max_sequence_num = 0
+            # Regex to find filenames starting with 4 digits, followed by optional suffixes, ending in .mp4 or .txt
+            sequence_pattern = re.compile(r"^(\d{4}).*?\.(mp4|txt)$")
 
-            if total_variations_for_item > 1:
-                # Multiple variations requested for this input image, so add suffix
-                base_name_with_gen = f"{base_name}_{current_variation_index:04d}"
-                print(f"{log_prefix} Batch mode (multi-variation): Determined base name with suffix: {base_name_with_gen}")
-            else:
-                # Only one variation requested for this input image, use stem directly
-                base_name_with_gen = base_name
-                print(f"{log_prefix} Batch mode (single variation): Determined direct stem name: {base_name_with_gen}")
-        # --- Single/Sequential mode name determination moved later ---
+            try:
+                # Ensure output directory exists before scanning
+                output_dir.mkdir(parents=True, exist_ok=True)
+                for filename in os.listdir(output_dir):
+                    match = sequence_pattern.match(filename)
+                    if match:
+                        num = int(match.group(1))
+                        if num > max_sequence_num:
+                            max_sequence_num = num
+                print(f"{log_prefix} Highest sequence number found: {max_sequence_num}")
+            except FileNotFoundError:
+                # This case should be less likely now due to mkdir above, but keep for safety
+                print(f"{log_prefix} Output directory was not found during scan. Starting sequence from 1.")
+                max_sequence_num = 0 # Ensure it starts at 1 if dir doesn't exist
+            except Exception as e:
+                print(f"{log_prefix} Warning: Error scanning output directory for sequence numbers: {e}. Starting sequence from 1.")
+                traceback.print_exc() # Log the full error for debugging
+                max_sequence_num = 0 # Default to 0 on other errors
+
+            # Determine the base name for THIS generation task (all variations share this base)
+            next_sequence_num = max_sequence_num + 1
+            base_name = f"{next_sequence_num:04d}"
+            print(f"{log_prefix} Sequential mode: Using base sequence number '{base_name}' for this generation task.")
+
+            # Construct the final name stem for THIS specific file (base + suffixes)
+            base_name_with_suffixes = f"{base_name}{prompt_suffix}{variation_suffix}"
+            print(f"{log_prefix} Sequential mode: Final name stem for this specific file: '{base_name_with_suffixes}'")
 
 
-        # Extract other parameters (keep early for validation/processing)
+        # Extract other parameters
         num_frames = args['num_frames']
         fps = args['fps']
         audio_path = args['audio_path']
@@ -270,61 +294,39 @@ def main(
         seed = args['seed']
         save_video_quality = args.get('save_video_quality', 18) # Use CRF, default 18
 
+        # <<< Use actual prompt passed for this specific run >>>
+        current_prompt = args['prompt'] # This is the single line prompt for this run
+
         print(f"{log_prefix} Source Image: {Path(image_path).name}")
         print(f"{log_prefix} Source Audio: {Path(audio_path).name}")
+        print(f"{log_prefix} Current Prompt: '{current_prompt[:100]}{'...' if len(current_prompt)>100 else ''}'") # Log truncated prompt
         print(f"{log_prefix} Target dims: {width}x{height}, Frames: {num_frames}, FPS: {fps}, Seed: {seed}, Quality (CRF): {save_video_quality}")
 
-    except KeyError as e:
-        print(f"{log_prefix} !!! Error: Missing required argument: {e}")
-        raise ValueError(f"Missing required argument in args dictionary: {e}") from e
-    except Exception as e:
-        print(f"{log_prefix} !!! Error during parameter extraction or path setup: {e}")
-        traceback.print_exc()
-        raise # Re-raise critical setup error
+    except KeyError as e: print(f"{log_prefix} !!! Error: Missing required argument: {e}"); raise ValueError(f"Missing required argument: {e}") from e
+    except Exception as e: print(f"{log_prefix} !!! Error during parameter extraction: {e}"); traceback.print_exc(); raise
 
 
     # --- Load and Resize Image ---
     try:
-        print(f"{log_prefix} Loading and resizing image from: {image_path} to {width}x{height}")
-        image = Image.open(image_path).convert("RGB")
-        # Use LANCZOS for high-quality resize
-        image = image.resize((width, height), Image.Resampling.LANCZOS)
+        print(f"{log_prefix} Loading/resizing image: {image_path} to {width}x{height}")
+        image = Image.open(image_path).convert("RGB").resize((width, height), Image.Resampling.LANCZOS)
         print(f"{log_prefix} Resized image size: {image.size}")
-    except FileNotFoundError:
-         print(f"{log_prefix} !!! Error: Input image file not found at {image_path}")
-         raise
-    except Exception as e:
-        print(f"{log_prefix} !!! Error loading or resizing image: {e}")
-        traceback.print_exc()
-        raise
+    except FileNotFoundError: print(f"{log_prefix} !!! Error: Input image not found: {image_path}"); raise
+    except Exception as e: print(f"{log_prefix} !!! Error loading/resizing image: {e}"); traceback.print_exc(); raise
 
 
     # --- Extract Audio Features ---
-    # Device needs to be determined (assuming it's passed or inferred)
-    device = pipe.device if pipe else "cuda" # Get device from pipeline if possible
-    print(f"{log_prefix} Determined target device for audio processing: {device}")
+    device = pipe.device if pipe else "cuda"; print(f"{log_prefix} Target device for audio: {device}")
     try:
-        print(f"{log_prefix} Extracting audio features (Target FPS={fps}, Target NumFrames={num_frames})...")
-        # Ensure audio file exists before processing
-        if not Path(audio_path).exists():
-             raise FileNotFoundError(f"Audio file not found: {audio_path}")
-        # Check duration again right before processing, in case file changed
-        actual_audio_duration = librosa.get_duration(filename=audio_path)
-        if actual_audio_duration <= 0:
-             raise ValueError(f"Audio file has zero or negative duration: {audio_path}")
-        print(f"{log_prefix} Confirmed audio duration before feature extraction: {actual_audio_duration:.2f}s")
+        print(f"{log_prefix} Extracting audio features (FPS={fps}, NumFrames={num_frames})...")
+        if not Path(audio_path).exists(): raise FileNotFoundError(f"Audio file not found: {audio_path}")
+        actual_audio_duration = librosa.get_duration(filename=audio_path); print(f"{log_prefix} Confirmed audio duration: {actual_audio_duration:.2f}s")
+        if actual_audio_duration <= 0: raise ValueError(f"Audio file has zero/negative duration: {audio_path}")
 
-        audio_wav2vec_fea = get_audio_features(
-            wav2vec, wav2vec_processor, audio_path, fps, num_frames 
-        )
+        audio_wav2vec_fea = get_audio_features(wav2vec, wav2vec_processor, audio_path, fps, num_frames)
         print(f"{log_prefix} Audio Wav2Vec features extracted, shape: {audio_wav2vec_fea.shape}, device: {audio_wav2vec_fea.device}")
-    except FileNotFoundError as e:
-        print(f"{log_prefix} !!! Error: Audio file not found during feature extraction: {e}")
-        raise
-    except Exception as e:
-        print(f"{log_prefix} !!! Error extracting audio features: {e}")
-        traceback.print_exc()
-        raise
+    except FileNotFoundError as e: print(f"{log_prefix} !!! Error: Audio file not found: {e}"); raise
+    except Exception as e: print(f"{log_prefix} !!! Error extracting audio features: {e}"); traceback.print_exc(); raise
 
 
     # --- Process Audio Features (Projection & Splitting) ---
@@ -332,390 +334,196 @@ def main(
         print(f"{log_prefix} Projecting audio features...")
         audio_proj_fea = fantasytalking.get_proj_fea(audio_wav2vec_fea)
         print(f"{log_prefix} Audio projected features calculated, shape: {audio_proj_fea.shape}")
-
-        # Calculate split points based on the *actual number of frames* being generated
         print(f"{log_prefix} Calculating audio split points for num_frames={num_frames}...")
-        pos_idx_ranges = fantasytalking.split_audio_sequence(
-            audio_proj_fea.size(1), num_frames=num_frames # Use the final num_frames
-        )
+        pos_idx_ranges = fantasytalking.split_audio_sequence(audio_proj_fea.size(1), num_frames=num_frames)
         print(f"{log_prefix} Splitting audio features tensor...")
-        audio_proj_split, audio_context_lens = fantasytalking.split_tensor_with_padding(
-            audio_proj_fea, pos_idx_ranges, expand_length=4 # Assuming expand_length=4 is standard
-        )
-        print(f"{log_prefix} Audio features split, shape: {audio_proj_split.shape}, context lengths calculated: {audio_context_lens}")
-    except Exception as e:
-        print(f"{log_prefix} !!! Error processing projected audio features: {e}")
-        traceback.print_exc()
-        raise
+        audio_proj_split, audio_context_lens = fantasytalking.split_tensor_with_padding(audio_proj_fea, pos_idx_ranges, expand_length=4)
+        print(f"{log_prefix} Audio features split, shape: {audio_proj_split.shape}, context lengths: {audio_context_lens}")
+    except Exception as e: print(f"{log_prefix} !!! Error processing projected audio features: {e}"); traceback.print_exc(); raise
 
 
     # --- Prepare Diffusion Pipeline Arguments ---
     print(f"{log_prefix} Preparing arguments for WanVideoPipeline...")
     try:
-        # Determine correct latent frame count based on num_frames
-        latents_num_frames = (num_frames - 1) // 4 + 1
-        print(f"{log_prefix} Calculated latents_num_frames: {latents_num_frames}")
-
+        latents_num_frames = (num_frames - 1) // 4 + 1; print(f"{log_prefix} Calculated latents_num_frames: {latents_num_frames}")
         pipe_kwargs = {
-            "prompt": args['prompt'],
+            "prompt": current_prompt, # <<< Use the specific prompt for this run
             "negative_prompt": args['negative_prompt'],
-            "input_image": image, # Use the resized PIL Image object
-            "width": width,
-            "height": height,
-            "num_frames": num_frames, # Use the final calculated num_frames
-            "num_inference_steps": args['inference_steps'],
-            "seed": seed,
-            "tiled": args['tiled_vae'], # Use the boolean value directly
-            "audio_scale": args['audio_weight'], # Map from Gradio 'audio_weight'
+            "input_image": image,
+            "width": width, "height": height, "num_frames": num_frames,
+            "num_inference_steps": args['inference_steps'], "seed": seed,
+            "tiled": args['tiled_vae'],
+            "audio_scale": args['audio_weight'],
             "cfg_scale": args['prompt_cfg_scale'],
             "audio_cfg_scale": args['audio_cfg_scale'],
-            # Ensure audio features are on the correct device and dtype
-            "audio_proj": audio_proj_split.to(device=pipe.device, dtype=torch.bfloat16),
+            "audio_proj": audio_proj_split.to(device=pipe.device, dtype=torch.bfloat16), # <<< Use pipe's dtype
             "audio_context_lens": audio_context_lens,
-            "latents_num_frames": latents_num_frames, # Pass calculated latent frames
-            "denoising_strength": args.get('denoising_strength', 1.0), # Use .get for safety
-            "sigma_shift": args.get('sigma_shift', 5.0), # Pass sigma_shift from args
-            # cancel_fn will be passed separately below
+            "latents_num_frames": latents_num_frames,
+            "denoising_strength": args.get('denoising_strength', 1.0),
+            "sigma_shift": args.get('sigma_shift', 5.0),
         }
-
         if args['tiled_vae']:
-            # Ensure tile sizes/strides are integers
             try:
-                tile_size_h = int(args['tile_size_h'])
-                tile_size_w = int(args['tile_size_w'])
-                tile_stride_h = int(args['tile_stride_h'])
-                tile_stride_w = int(args['tile_stride_w'])
-                pipe_kwargs["tile_size"] = (tile_size_h, tile_size_w)
-                pipe_kwargs["tile_stride"] = (tile_stride_h, tile_stride_w)
-                print(f"{log_prefix} Tiling enabled with size: {pipe_kwargs['tile_size']}, stride: {pipe_kwargs['tile_stride']}")
-            except (ValueError, TypeError, KeyError) as e:
-                 print(f"{log_prefix} Warning: Invalid tiling parameters provided ({e}). Disabling tiling.")
-                 pipe_kwargs["tiled"] = False # Disable if params invalid
-        else:
-            print(f"{log_prefix} Tiling disabled.")
+                pipe_kwargs["tile_size"] = (int(args['tile_size_h']), int(args['tile_size_w']))
+                pipe_kwargs["tile_stride"] = (int(args['tile_stride_h']), int(args['tile_stride_w']))
+                print(f"{log_prefix} Tiling enabled: size={pipe_kwargs['tile_size']}, stride={pipe_kwargs['tile_stride']}")
+            except (ValueError, TypeError, KeyError) as e: print(f"{log_prefix} Warning: Invalid tiling params ({e}). Disabling tiling."); pipe_kwargs["tiled"] = False
+        else: print(f"{log_prefix} Tiling disabled.")
 
-        # Log prepared arguments (excluding large tensors/images)
-        print(f"{log_prefix} Pipeline arguments prepared:")
-        printable_pipe_kwargs = {}
-        for k, v in pipe_kwargs.items():
-            if isinstance(v, torch.Tensor):
-                printable_pipe_kwargs[k] = f"<Tensor shape={v.shape} dtype={v.dtype} device={v.device}>"
-            elif isinstance(v, Image.Image):
-                 printable_pipe_kwargs[k] = f"<PIL.Image size={v.size} mode={v.mode}>"
-            else:
-                 printable_pipe_kwargs[k] = v
+        print(f"{log_prefix} Pipeline arguments prepared (excluding large tensors/images):")
+        printable_pipe_kwargs = {k: f"<Tensor shape={v.shape} dtype={v.dtype} dev={v.device}>" if isinstance(v, torch.Tensor) else (f"<PIL Image {v.size} {v.mode}>" if isinstance(v, Image.Image) else v) for k, v in pipe_kwargs.items()}
         pprint.pprint(printable_pipe_kwargs, indent=2, width=120)
 
-    except KeyError as e:
-        print(f"{log_prefix} !!! Error: Missing expected argument while preparing pipeline kwargs: {e}")
-        raise ValueError(f"Missing argument for pipeline: {e}") from e
-    except Exception as e:
-        print(f"{log_prefix} !!! Error preparing pipeline arguments: {e}")
-        traceback.print_exc()
-        raise
+    except KeyError as e: print(f"{log_prefix} !!! Error: Missing argument for pipeline: {e}"); raise ValueError(f"Missing argument for pipeline: {e}") from e
+    except Exception as e: print(f"{log_prefix} !!! Error preparing pipeline arguments: {e}"); traceback.print_exc(); raise
 
 
     # --- Image-to-Video Diffusion Pipeline Execution ---
     print(f"{log_prefix} Starting WanVideoPipeline generation ({pipe_kwargs['num_inference_steps']} steps)...")
-    video_frames_pil = None # Initialize variable
-    pipeline_start_time = time.perf_counter()
+    video_frames_pil = None; pipeline_start_time = time.perf_counter()
     try:
-        # *** Pass cancel_fn, tqdm, and gradio_progress to the pipeline call ***
-        video_frames_pil = pipe(
-            **pipe_kwargs,
-            cancel_fn=cancel_fn,
-            progress_bar_cmd=tqdm, # <<< Pass tqdm for console progress
-            gradio_progress=gradio_progress # <<< Pass Gradio progress object
-        )
-        # *******************************************
+        video_frames_pil = pipe(**pipe_kwargs, cancel_fn=cancel_fn, progress_bar_cmd=tqdm, gradio_progress=gradio_progress)
         pipeline_duration = time.perf_counter() - pipeline_start_time
         print(f"{log_prefix} WanVideoPipeline finished successfully in {pipeline_duration:.2f}s.")
-        if isinstance(video_frames_pil, list) and len(video_frames_pil) > 0 and isinstance(video_frames_pil[0], Image.Image):
-             print(f"{log_prefix} Received {len(video_frames_pil)} PIL frames.")
-        else:
-             # This case should ideally not happen if pipe returns correctly
-             print(f"{log_prefix} Warning: Pipeline returned unexpected type or empty list: {type(video_frames_pil)}")
-             raise ValueError("Pipeline did not return a list of PIL Image frames.")
+        if isinstance(video_frames_pil, list) and len(video_frames_pil) > 0 and isinstance(video_frames_pil[0], Image.Image): print(f"{log_prefix} Received {len(video_frames_pil)} PIL frames.")
+        else: print(f"{log_prefix} Warning: Pipeline returned unexpected type/empty list: {type(video_frames_pil)}"); raise ValueError("Pipeline did not return list of PIL Images.")
 
         # --- Replace First Frame with Input Image ---
-        if isinstance(video_frames_pil, list) and len(video_frames_pil) > 0:
-            print(f"{log_prefix} Replacing first generated frame with the input image.")
-            video_frames_pil[0] = image # 'image' is the resized input PIL Image
-        else:
-             print(f"{log_prefix} Warning: Cannot replace first frame as video_frames_pil is not a non-empty list.")
-        # ---------------------------------------------
+        if isinstance(video_frames_pil, list) and len(video_frames_pil) > 0: print(f"{log_prefix} Replacing first frame with input image."); video_frames_pil[0] = image
+        else: print(f"{log_prefix} Warning: Cannot replace first frame (video_frames_pil invalid).")
 
-    except CancelledError as e: # Catch the specific error from the pipeline
-        pipeline_duration = time.perf_counter() - pipeline_start_time
-        print(f"{log_prefix} Pipeline cancelled by user after {pipeline_duration:.2f}s. Message: {e}")
-        # No model unloading here, handled by caller (secourses_app.py)
-        raise # Re-raise CancelledError to be caught by Gradio app loop/handler
+    except CancelledError as e:
+        pipeline_duration = time.perf_counter() - pipeline_start_time; print(f"{log_prefix} Pipeline cancelled after {pipeline_duration:.2f}s. Message: {e}"); raise
     except Exception as e:
-        pipeline_duration = time.perf_counter() - pipeline_start_time
-        print(f"{log_prefix} !!! Critical Error during WanVideoPipeline execution after {pipeline_duration:.2f}s: {e}")
-        traceback.print_exc()
-        # Attempt to clear cache even on general errors
-        print(f"{log_prefix} Attempting to clear CUDA cache after pipeline error...")
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            print(f"{log_prefix} CUDA cache clear attempted.")
-        else:
-            print(f"{log_prefix} CUDA not available, skipping cache clear.")
-        raise # Re-raise the original exception
+        pipeline_duration = time.perf_counter() - pipeline_start_time; print(f"{log_prefix} !!! Critical Error during Pipeline execution after {pipeline_duration:.2f}s: {e}"); traceback.print_exc()
+        if torch.cuda.is_available(): print(f"{log_prefix} Clearing CUDA cache after error..."); torch.cuda.empty_cache(); print(f"{log_prefix} Cache clear attempted.")
+        raise
 
 
     # --- Convert PIL Frames to Numpy Array ---
     try:
         print(f"{log_prefix} Converting {len(video_frames_pil)} PIL frames to NumPy array...")
-        # Ensure frames are RGB uint8 [0, 255]
-        # Using np.stack which is generally efficient
         video_array = np.stack([np.array(frame.convert("RGB")) for frame in video_frames_pil])
-        # Expected shape: (T, H, W, C)
-        print(f"{log_prefix} Video array created with shape: {video_array.shape}, dtype: {video_array.dtype}")
-        # Allow slight variations due to 4k+1 calculation potentially adding frames
-        # if abs(video_array.shape[0] - num_frames) > 1: # Allow diff of 0 or 1 frame perhaps?
-        #     print(f"{log_prefix} Warning: Number of frames in array ({video_array.shape[0]}) differs significantly from requested ({num_frames}).")
-        # Or simply trust the pipeline output length
-        if video_array.shape[1] != height or video_array.shape[2] != width:
-             print(f"{log_prefix} Warning: Frame dimensions ({video_array.shape[1]}x{video_array.shape[2]}) don't match requested ({height}x{width}).")
+        print(f"{log_prefix} Video array shape: {video_array.shape}, dtype: {video_array.dtype}")
+        if video_array.shape[1] != height or video_array.shape[2] != width: print(f"{log_prefix} Warning: Frame dims ({video_array.shape[1:3]}) != requested ({height}x{width}).")
+    except Exception as e: print(f"{log_prefix} !!! Error converting PIL frames to NumPy: {e}"); traceback.print_exc(); raise
 
-    except Exception as e:
-        print(f"{log_prefix} !!! Error converting PIL frames to NumPy array: {e}")
-        traceback.print_exc()
-        raise # Re-raise critical error
 
     # --- Determine Filename for Single/Sequential Mode & Define All Paths ---
-    print(f"{log_prefix} Determining final output paths...")
-    audio_path_obj = Path(audio_path) # Need suffix info
+    # <<< REMOVED redundant sequential naming logic block >>>
+    # <<< The logic determining base_name and base_name_with_suffixes now happens earlier (lines ~253-292) >>>
+    # <<< Paths are now defined using the base_name_with_suffixes calculated there. >>>
 
-    if not output_base_name_arg:
-        # Single/Sequential mode: Find the next available 000X number just before saving temp/audio copy
-        print(f"{log_prefix} Single mode: Finding next available sequential base name...")
-        sequence_num = 1
-        while True:
-            potential_base_name = f"{sequence_num:04d}"
-            # Check if *any* file starting with this base name + generation index exists
-            # Check against the specific suffixed name we intend to use
-            potential_final_video_path = output_dir / f"{potential_base_name}_{generation_index:04d}.mp4"
-            potential_final_meta_path = output_dir / f"{potential_base_name}_{generation_index:04d}.txt"
-            # Also check if the base name *without* suffix exists (in case of old naming or single-gen runs)
-            potential_base_video_path = output_dir / f"{potential_base_name}.mp4"
-            potential_base_meta_path = output_dir / f"{potential_base_name}.txt"
+    # Ensure base_name_with_suffixes was determined earlier
+    if base_name_with_suffixes is None:
+        # This should not happen if secourses_app.py provides output_base_name
+        # or if the initial sequential logic ran correctly.
+        raise RuntimeError(f"{log_prefix} Failed to determine a valid base_name_with_suffixes earlier in the script.")
 
-            if not potential_final_video_path.exists() and \
-               not (save_metadata and potential_final_meta_path.exists()) and \
-               not potential_base_video_path.exists() and \
-               not (save_metadata and potential_base_meta_path.exists()):
-                base_name = potential_base_name
-                # --- Logic change: Decide suffix based on total_generations --- #
-                if total_generations == 1:
-                    base_name_with_gen = base_name # No suffix if only 1 generation requested
-                    print(f"{log_prefix} Single mode (1 gen): Found unique base name '{base_name}', using final name: '{base_name_with_gen}'")
-                else:
-                    # Always append the current generation index if multiple generations requested
-                    base_name_with_gen = f"{base_name}_{generation_index:04d}"
-                    print(f"{log_prefix} Single mode (>1 gen): Found unique base name '{base_name}', using final name with suffix: '{base_name_with_gen}'")
-                # --- End Logic change ---
-                break # Found a suitable base name
+    print(f"{log_prefix} Using determined base name with suffixes: '{base_name_with_suffixes}'")
+    print(f"{log_prefix} Determining final output paths based on this name...")
+    audio_path_obj = Path(audio_path)
 
-            sequence_num += 1
-            if sequence_num > 99999: # Increased safety break limit
-                raise RuntimeError(f"{log_prefix} Could not find an unused sequential base filename number after {sequence_num-1} attempts in {output_dir}.")
-
-    # --- Define paths using the final base_name_with_gen (determined now for both modes) ---
-    if not base_name_with_gen: # Safety check
-        raise RuntimeError(f"{log_prefix} Failed to determine a valid base_name_with_gen.")
-
-    save_path = output_dir / f"{base_name_with_gen}.mp4"
+    # Define paths using the final base_name_with_suffixes (determined earlier)
+    save_path = output_dir / f"{base_name_with_suffixes}.mp4"
+    metadata_path = None # Initialize
     if save_metadata:
-        metadata_path = output_dir / f"{base_name_with_gen}.txt"
+        metadata_path = output_dir / f"{base_name_with_suffixes}.txt"
 
-    # Define temporary path using the determined base_name_with_gen
-    tmp_suffix = f"tmp_{base_name_with_gen}_{int(time.time())}_{os.getpid()}.mp4"
+    # Temporary file name still needs to be unique per process/time
+    tmp_suffix = f"tmp_{base_name_with_suffixes}_{int(time.time())}_{os.getpid()}.mp4"
     save_path_tmp = output_dir / tmp_suffix
 
-    # Define the name for the copied audio file
-    used_audio_filename = f"{base_name_with_gen}{audio_path_obj.suffix}"
-    used_audio_dest_path = USED_AUDIO_DIR / used_audio_filename # Define the full destination path here
+    # Use base_name_with_suffixes for the copied audio name as well
+    used_audio_filename = f"{base_name_with_suffixes}{audio_path_obj.suffix}"
+    used_audio_dest_path = USED_AUDIO_DIR / used_audio_filename
 
     print(f"{log_prefix} Final Save Path: {save_path}")
-    if metadata_path:
-        print(f"{log_prefix} Metadata Save Path: {metadata_path}")
+    if metadata_path: print(f"{log_prefix} Metadata Save Path: {metadata_path}")
     print(f"{log_prefix} Temporary Video Path: {save_path_tmp}")
     print(f"{log_prefix} Copied Input Audio Path: {used_audio_dest_path}")
     # --- End Filename Determination ---
 
 
     # --- Save Input Audio Copy --- #
-    # Do this *before* potentially failing FFmpeg step, using the path defined above
-    saved_audio_path_str = None # Track path for metadata
-    try:
-        shutil.copy2(audio_path, used_audio_dest_path) # copy2 preserves metadata
-        saved_audio_path_str = str(used_audio_dest_path.resolve())
-        print(f"{log_prefix} Copied input audio to: {used_audio_dest_path}")
-    except Exception as copy_e:
-        print(f"{log_prefix} !!! Warning: Failed to copy input audio {audio_path} to {used_audio_dest_path}: {copy_e}")
-        # Continue generation even if audio copy fails, but log it.
-        traceback.print_exc() # Log full traceback for the warning
-    # -------------------------- #
+    saved_audio_path_str = None
+    try: shutil.copy2(audio_path, used_audio_dest_path); saved_audio_path_str = str(used_audio_dest_path.resolve()); print(f"{log_prefix} Copied input audio to: {used_audio_dest_path}")
+    except Exception as copy_e: print(f"{log_prefix} !!! Warning: Failed to copy input audio {audio_path} to {used_audio_dest_path}: {copy_e}"); traceback.print_exc()
 
 
-    # --- Save Temporary Video (using diffsynth's save_video or alternative) ---
-    # Consider if save_video handles T,H,W,C format correctly and desired codec/quality
-    try:
-        print(f"{log_prefix} Saving generated frames to temporary video: {save_path_tmp}")
-        # save_video might use OpenCV which expects BGR by default if writing directly
-        # If save_video uses moviepy or ffmpeg backend, RGB might be fine. Check its implementation.
-        # Assuming save_video handles RGB (T,H,W,C) numpy array:
-        save_video(video_array, str(save_path_tmp), fps=fps) # Use default quality for temp
-        # If save_video expects BGR, convert first:
-        # save_video(video_array[..., ::-1], str(save_path_tmp), fps=fps)
-        print(f"{log_prefix} Temporary video saved successfully.")
-    except Exception as e:
-        print(f"{log_prefix} !!! Error saving temporary video using save_video utility: {e}")
-        traceback.print_exc()
-        # As a fallback, could try saving with a different library here if needed
-        raise # Re-raise critical error
+    # --- Save Temporary Video ---
+    try: print(f"{log_prefix} Saving frames to temporary video: {save_path_tmp}"); save_video(video_array, str(save_path_tmp), fps=fps); print(f"{log_prefix} Temporary video saved.")
+    except Exception as e: print(f"{log_prefix} !!! Error saving temporary video: {e}"); traceback.print_exc(); raise
 
 
     # --- Combine Video and Audio using FFmpeg ---
     print(f"{log_prefix} Merging video and audio using FFmpeg (CRF: {save_video_quality})...")
-    # Use a robust ffmpeg command with error checking
-    final_command = [
-        "ffmpeg",
-        "-y", # Overwrite output file without asking
-        "-i", str(save_path_tmp), # Input temporary video
-        "-i", audio_path, # Input original audio
-        "-map", "0:v:0", # Map video stream from first input
-        "-map", "1:a:0?", # Map audio stream from second input, '?' makes it optional
-        "-c:v", "libx264", # Video codec (widely compatible)
-        "-preset", "slow", # Encoding speed preset (good balance) - can be medium or slow for better compression
-        "-crf", str(save_video_quality), # Constant Rate Factor (0=lossless, 18=high, 23=default, 51=low)
-        "-pix_fmt", "yuv420p", # Pixel format for compatibility
-        "-c:a", "aac",     # Audio codec (widely compatible)
-        "-b:a", "192k",    # Audio bitrate (adjust if needed)
-        "-shortest", # Finish encoding when the shortest input stream ends (usually audio)
-        str(save_path), # Final output path (ensure it's a string)
-    ]
+    final_command = ["ffmpeg", "-y", "-i", str(save_path_tmp), "-i", audio_path, "-map", "0:v:0", "-map", "1:a:0?", "-c:v", "libx264", "-preset", "slow", "-crf", str(save_video_quality), "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-shortest", str(save_path)]
     print(f"{log_prefix} Running FFmpeg command: {' '.join(final_command)}")
     ffmpeg_start_time = time.perf_counter()
     try:
-        process = subprocess.run(
-            final_command,
-            check=True,        # Raise CalledProcessError on failure
-            capture_output=True, # Capture stdout and stderr
-            text=True,         # Decode stdout/stderr as text
-            encoding='utf-8'   # Specify encoding for robustness
-        )
-        ffmpeg_duration = time.perf_counter() - ffmpeg_start_time
-        print(f"{log_prefix} FFmpeg command executed successfully in {ffmpeg_duration:.2f}s.")
-        # Optional: Log ffmpeg output for debugging success cases too
-        # print(f"{log_prefix} FFmpeg stdout:\n{process.stdout}")
-        # print(f"{log_prefix} FFmpeg stderr:\n{process.stderr}") # Often contains useful info
+        process = subprocess.run(final_command, check=True, capture_output=True, text=True, encoding='utf-8')
+        ffmpeg_duration = time.perf_counter() - ffmpeg_start_time; print(f"{log_prefix} FFmpeg completed successfully in {ffmpeg_duration:.2f}s.")
+        # print(f"{log_prefix} FFmpeg stderr:\n{process.stderr}") # Optional: log stderr on success too
     except subprocess.CalledProcessError as e:
-        ffmpeg_duration = time.perf_counter() - ffmpeg_start_time
-        print(f"{log_prefix} !!! Error during FFmpeg processing after {ffmpeg_duration:.2f}s (Exit code: {e.returncode})")
-        print(f"{log_prefix} Failed FFmpeg command: {' '.join(e.cmd)}")
-        # Log stderr which usually contains the error message
-        print(f"{log_prefix} FFmpeg stderr:\n{e.stderr}")
-        # Keep the temp file if ffmpeg fails for debugging
-        print(f"{log_prefix} FFmpeg failed, temporary file kept at: {save_path_tmp}")
-        # Raise a more informative exception
-        error_summary = e.stderr.splitlines()[-5:] # Get last few lines of stderr
-        raise Exception(f"FFmpeg failed to merge video and audio. Check logs. Temp file: {save_path_tmp}. Error: {' '.join(error_summary)}") from e
-    except FileNotFoundError:
-        print(f"{log_prefix} !!! Error: 'ffmpeg' command not found. Please ensure ffmpeg is installed and in your system's PATH.")
-        raise Exception("'ffmpeg' not found. Please install ffmpeg and ensure it's in the PATH.")
-    except Exception as e:
-        # Catch other potential errors during subprocess execution
-        print(f"{log_prefix} !!! An unexpected error occurred during FFmpeg execution: {e}")
-        traceback.print_exc()
-        raise # Re-raise
+        ffmpeg_duration = time.perf_counter() - ffmpeg_start_time; print(f"{log_prefix} !!! Error during FFmpeg (Exit code: {e.returncode}) after {ffmpeg_duration:.2f}s"); print(f"{log_prefix} Failed command: {' '.join(e.cmd)}"); print(f"{log_prefix} FFmpeg stderr:\n{e.stderr}")
+        print(f"{log_prefix} FFmpeg failed, temp file kept: {save_path_tmp}")
+        error_summary = e.stderr.splitlines()[-5:]; raise Exception(f"FFmpeg failed. Temp: {save_path_tmp}. Error: {' '.join(error_summary)}") from e
+    except FileNotFoundError: print(f"{log_prefix} !!! Error: 'ffmpeg' not found."); raise Exception("'ffmpeg' not found. Install ffmpeg.")
+    except Exception as e: print(f"{log_prefix} !!! Unexpected error during FFmpeg: {e}"); traceback.print_exc(); raise
 
 
-    # --- Clean up temporary file only if FFmpeg succeeded and final file exists ---
+    # --- Clean up temporary file ---
     if save_path.exists():
-        try:
-            print(f"{log_prefix} Removing temporary file: {save_path_tmp}")
-            os.remove(save_path_tmp)
-            print(f"{log_prefix} Temporary file removed successfully.")
-        except OSError as e:
-            # This is not critical, just log a warning
-            print(f"{log_prefix} Warning: Could not remove temporary file {save_path_tmp}: {e}")
-    else:
-         # This indicates a problem if FFmpeg didn't error but the file is missing
-         print(f"{log_prefix} Warning: Final output file {save_path} not found after FFmpeg process. Temporary file {save_path_tmp} may be kept.")
+        try: print(f"{log_prefix} Removing temporary file: {save_path_tmp}"); os.remove(save_path_tmp); print(f"{log_prefix} Temp file removed.")
+        except OSError as e: print(f"{log_prefix} Warning: Could not remove temp file {save_path_tmp}: {e}")
+    else: print(f"{log_prefix} Warning: Final output {save_path} not found after FFmpeg. Temp file {save_path_tmp} may be kept.")
 
 
     # --- Metadata Saving Logic ---
-    if save_metadata and metadata_path: # Ensure path was set (i.e., saving enabled)
+    if save_metadata and metadata_path:
         print(f"{log_prefix} Saving metadata to {metadata_path}...")
         try:
-            end_time_global = datetime.now()
-            end_time_perf = time.perf_counter()
-            generation_duration_perf = end_time_perf - start_time_perf
-            generation_duration_wall = end_time_global - start_time_global
-
-            # Create metadata dictionary - include essential args
+            end_time_global = datetime.now(); end_time_perf = time.perf_counter(); generation_duration_perf = end_time_perf - start_time_perf; generation_duration_wall = end_time_global - start_time_global
             metadata = {
                 "generation_timestamp_utc": start_time_global.utcnow().isoformat() + "Z",
                 "generation_duration_seconds": round(generation_duration_perf, 3),
                 "generation_wall_time_seconds": round(generation_duration_wall.total_seconds(), 3),
                 "output_video_file": save_path.name,
-                "output_metadata_file": metadata_path.name if metadata_path else "N/A", # Handle case where metadata is off
-                "base_name_with_gen": base_name_with_gen, # The final name including suffix
+                "output_metadata_file": metadata_path.name if metadata_path else "N/A",
+                "base_name_with_suffixes": base_name_with_suffixes, # <<< Use the name including suffixes
                 "input_image_file": Path(args['image_path']).name,
                 "input_audio_file": Path(args['audio_path']).name,
-                "saved_input_audio_copy": saved_audio_path_str, # Path to copied audio
-                "generation_index": generation_index,
-                "total_generations": total_generations,
-                # Include relevant settings from the input args dictionary for reproducibility
+                "saved_input_audio_copy": saved_audio_path_str,
+                "variation_index": generation_index, # <<< Renamed for clarity
+                "total_variations_for_prompt": total_generations, # <<< Renamed for clarity
+                "prompt_index": prompt_index, # <<< Added prompt index (1-based or None)
                 "settings": {
-                     "prompt": args['prompt'],
+                     "prompt": current_prompt, # <<< Save the specific prompt used
                      "negative_prompt": args['negative_prompt'],
-                     "width": args['width'],
-                     "height": args['height'],
-                     "num_frames": args['num_frames'],
-                     "fps": args['fps'],
-                     "audio_weight": args['audio_weight'],
-                     "prompt_cfg_scale": args['prompt_cfg_scale'],
-                     "audio_cfg_scale": args['audio_cfg_scale'],
-                     "inference_steps": args['inference_steps'],
-                     "seed": args['seed'],
+                     "width": args['width'], "height": args['height'], "num_frames": args['num_frames'], "fps": args['fps'],
+                     "audio_weight": args['audio_weight'], "prompt_cfg_scale": args['prompt_cfg_scale'], "audio_cfg_scale": args['audio_cfg_scale'],
+                     "inference_steps": args['inference_steps'], "seed": args['seed'],
                      "tiled_vae": args['tiled_vae'],
-                     "tile_size_h": args.get('tile_size_h', 'N/A' if not args['tiled_vae'] else None),
-                     "tile_size_w": args.get('tile_size_w', 'N/A' if not args['tiled_vae'] else None),
-                     "tile_stride_h": args.get('tile_stride_h', 'N/A' if not args['tiled_vae'] else None),
-                     "tile_stride_w": args.get('tile_stride_w', 'N/A' if not args['tiled_vae'] else None),
-                     "sigma_shift": args.get('sigma_shift', 'N/A'),
-                     "denoising_strength": args.get('denoising_strength', 'N/A'),
+                     "tile_size_h": args.get('tile_size_h', 'N/A'), "tile_size_w": args.get('tile_size_w', 'N/A'),
+                     "tile_stride_h": args.get('tile_stride_h', 'N/A'), "tile_stride_w": args.get('tile_stride_w', 'N/A'),
+                     "sigma_shift": args.get('sigma_shift', 'N/A'), "denoising_strength": args.get('denoising_strength', 'N/A'),
                      "save_video_quality_crf": save_video_quality,
-                     # Add info about VRAM/dtype if available in args, otherwise skip
-                     # "torch_dtype": str(args.get('torch_dtype', 'N/A')), # Passed to load_models
-                     # "num_persistent_params": args.get('num_persistent_param_in_dit', 'N/A'), # Passed to load_models
+                     # Add pipeline dtype? Needs passing from app
+                     # "torch_dtype_pipeline": str(pipe.torch_dtype) if pipe else 'N/A',
                 }
             }
-
-            # Write JSON metadata
-            with open(metadata_path, 'w', encoding='utf-8') as f:
-                json.dump(metadata, f, indent=4, ensure_ascii=False)
+            with open(metadata_path, 'w', encoding='utf-8') as f: json.dump(metadata, f, indent=4, ensure_ascii=False)
             print(f"{log_prefix} Metadata saved successfully.")
-
-        except Exception as meta_e:
-            # Log error but don't fail the whole generation
-            print(f"{log_prefix} !!! Warning: Failed to save metadata to {metadata_path}: {meta_e}")
-            traceback.print_exc()
-    elif save_metadata and not metadata_path:
-         print(f"{log_prefix} Info: Metadata saving was enabled, but metadata path was not determined (this shouldn't happen). Skipping metadata save.")
-    else:
-         print(f"{log_prefix} Metadata saving disabled. Skipping.")
+        except Exception as meta_e: print(f"{log_prefix} !!! Warning: Failed to save metadata to {metadata_path}: {meta_e}"); traceback.print_exc()
+    elif save_metadata and not metadata_path: print(f"{log_prefix} Info: Metadata saving enabled but path not determined. Skipping.")
+    else: print(f"{log_prefix} Metadata saving disabled. Skipping.")
     # --- End Metadata Saving ---
 
 
     total_duration = time.perf_counter() - start_time_perf
     print(f"{log_prefix} ===== Finished Generation Task (Total duration: {total_duration:.2f}s) =====")
 
-    # Return the path to the final generated video
-    return str(save_path) # Return as string for Gradio
+    return str(save_path) # Return final path as string
 
 # --- END OF FILE infer.py ---
