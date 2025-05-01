@@ -96,8 +96,236 @@ TORCH_DTYPES_STR = {
     "FP8": torch.float8_e4m3fn,
 }
 TORCH_DTYPE_DEFAULT = "BF16"
+PRESET_DIR = Path("./presets") # Directory to store preset JSON files
 # ---------------
 
+
+# --- Preset Helper Functions ---
+def get_preset_files():
+    """Scans the PRESET_DIR for .json files and returns a list of preset names (stems)."""
+    PRESET_DIR.mkdir(parents=True, exist_ok=True)
+    presets = sorted([p.stem for p in PRESET_DIR.glob("*.json")])
+    return presets if presets else ["Default"] # Ensure "Default" exists if no files found
+
+# --- NEW ---
+LAST_PRESET_FILE = PRESET_DIR / "last_preset.txt"
+
+def load_last_used_preset():
+    """Loads the name of the last used preset from last_preset.txt."""
+    if LAST_PRESET_FILE.exists():
+        try:
+            last_preset_name = LAST_PRESET_FILE.read_text(encoding='utf-8').strip()
+            # Validate that the preset file actually exists
+            available_presets = get_preset_files()
+            if last_preset_name and last_preset_name in available_presets:
+                print(f"[Presets] Loaded last used preset name: {last_preset_name}")
+                return last_preset_name
+            else:
+                print(f"[Presets] Last used preset '{last_preset_name}' not found or invalid. Falling back to 'Default'.")
+        except Exception as e:
+            print(f"[Error][Presets] Failed to read last used preset file: {e}. Falling back to 'Default'.")
+    # Fallback if file doesn't exist or reading fails
+    return "Default"
+
+def save_last_used_preset(preset_name):
+    """Saves the name of the last used preset to last_preset.txt."""
+    try:
+        LAST_PRESET_FILE.write_text(preset_name, encoding='utf-8')
+        print(f"[Presets] Saved '{preset_name}' as last used preset.")
+    except Exception as e:
+        print(f"[Error][Presets] Failed to save last used preset '{preset_name}': {e}")
+        gr.Warning("Failed to save the last used preset setting.")
+
+# --- REMOVED get_latest_preset_name ---
+# def get_latest_preset_name(): ... (Removed)
+
+
+def get_default_settings():
+    """Returns a dictionary containing the default values for all settings."""
+    # Map setting name (string) to default value
+    return {
+        # Inputs / Basic
+        "prompt_input": DEFAULT_PROMPT,
+        "negative_prompt_input": DEFAULT_NEGATIVE_PROMPT,
+        "torch_dtype_dropdown": TORCH_DTYPE_DEFAULT,
+        "tiled_vae_checkbox": True,
+        "width_input": DEFAULT_WIDTH,
+        "height_input": DEFAULT_HEIGHT,
+        "duration_input": DEFAULT_DURATION,
+        "fps_input": DEFAULT_FPS,
+        "num_generations_input": 1,
+        # CFG / Steps / Seed
+        "prompt_cfg_scale": DEFAULT_PROMPT_CFG,
+        "audio_cfg_scale": DEFAULT_AUDIO_CFG,
+        "audio_weight": DEFAULT_AUDIO_WEIGHT,
+        "inference_steps": DEFAULT_INFERENCE_STEPS,
+        "seed_input": DEFAULT_SEED,
+        "random_seed_checkbox": False,
+        # Advanced
+        "sigma_shift": DEFAULT_SIGMA_SHIFT,
+        "denoising_strength": DEFAULT_DENOISING_STRENGTH,
+        "save_video_quality": DEFAULT_SAVE_QUALITY,
+        "save_metadata_checkbox": True,
+        # Performance / VRAM
+        "vram_preset_dropdown": VRAM_PRESET_DEFAULT, # Save the preset name
+        "vram_custom_value_input": VRAM_PRESETS[VRAM_PRESET_DEFAULT], # Save the derived value
+        "tile_size_h_input": DEFAULT_TILE_SIZE_H,
+        "tile_size_w_input": DEFAULT_TILE_SIZE_W,
+        "tile_stride_h_input": DEFAULT_TILE_STRIDE_H,
+        "tile_stride_w_input": DEFAULT_TILE_STRIDE_W,
+        # Batch settings (optional to save, but might be useful)
+        # "batch_input_folder_input": "",
+        # "batch_output_folder_input": str(OUTPUT_DIR),
+        # "batch_skip_existing_checkbox": True,
+        # "batch_use_gradio_audio_checkbox": True,
+        # "batch_use_gradio_prompt_checkbox": True,
+    }
+
+def create_default_preset_if_missing():
+    """Creates the presets folder and a 'Default.json' if it doesn't exist."""
+    PRESET_DIR.mkdir(parents=True, exist_ok=True)
+    default_preset_path = PRESET_DIR / "Default.json"
+    if not default_preset_path.exists():
+        print("[Presets] Default preset not found. Creating...")
+        default_settings = get_default_settings()
+        try:
+            with open(default_preset_path, 'w', encoding='utf-8') as f:
+                json.dump(default_settings, f, indent=4)
+            print(f"[Presets] Default preset saved to {default_preset_path}")
+        except Exception as e:
+            print(f"[Error][Presets] Failed to save default preset: {e}")
+            gr.Warning("Failed to create default preset file.")
+
+# --- End Preset Helper Functions ---
+
+
+# --- Core Preset Save/Load Functions ---
+# Global list to hold the variable names of components to save/load
+# Needs to be populated AFTER the UI components are defined.
+SETTING_COMPONENTS_VARS = []
+
+# --- Define the list of setting variable names globally ---
+SETTING_COMPONENTS_VARS = [
+    # Left Column
+    "prompt_input", "negative_prompt_input",
+    "torch_dtype_dropdown", "tiled_vae_checkbox",
+    "width_input", "height_input", "duration_input", "fps_input", "num_generations_input",
+    "prompt_cfg_scale", "audio_cfg_scale", "audio_weight",
+    "inference_steps", "seed_input", "random_seed_checkbox",
+    "sigma_shift", "denoising_strength", "save_video_quality", "save_metadata_checkbox",
+    "vram_preset_dropdown", "vram_custom_value_input", # Include both VRAM controls
+    "tile_size_h_input", "tile_size_w_input", "tile_stride_h_input", "tile_stride_w_input",
+    # Batch Tab (Add these if you want presets to save/load batch settings)
+    # "batch_input_folder_input", "batch_output_folder_input",
+    # "batch_skip_existing_checkbox", "batch_use_gradio_audio_checkbox", "batch_use_gradio_prompt_checkbox",
+]
+
+def save_preset(preset_name, *component_values):
+    """Saves the current settings to a JSON file."""
+    if not preset_name:
+        gr.Warning("Please enter a name for the preset.")
+        # Return an unchanged dropdown
+        return gr.update()
+
+    print(f"[Presets] Attempting to save preset: {preset_name}")
+    preset_path = PRESET_DIR / f"{preset_name}.json"
+
+    # Make sure the number of values matches the expected number of components
+    if len(component_values) != len(SETTING_COMPONENTS_VARS):
+        print(f"[Error][Presets] Mismatch between values provided ({len(component_values)}) and settings expected ({len(SETTING_COMPONENTS_VARS)}). Cannot save.")
+        gr.Error("Internal error: Settings count mismatch. Cannot save preset.")
+        return gr.Dropdown.update() # Return unchanged dropdown
+
+    # Create the dictionary mapping variable names to current values
+    settings_to_save = {}
+    for i, var_name in enumerate(SETTING_COMPONENTS_VARS):
+        settings_to_save[var_name] = component_values[i]
+
+    try:
+        with open(preset_path, 'w', encoding='utf-8') as f:
+            json.dump(settings_to_save, f, indent=4)
+        print(f"[Presets] Preset '{preset_name}' saved successfully to {preset_path}")
+        # --- ADDED ---
+        save_last_used_preset(preset_name) # Update last used preset on save
+        # -----------
+        gr.Info(f"Preset '{preset_name}' saved.")
+
+        # Refresh the dropdown list and select the newly saved preset
+        updated_choices = get_preset_files()
+        return gr.update(choices=updated_choices, value=preset_name)
+
+    except Exception as e:
+        print(f"[Error][Presets] Failed to save preset '{preset_name}': {e}")
+        traceback.print_exc()
+        gr.Error(f"Failed to save preset '{preset_name}': {e}")
+        return gr.Dropdown.update() # Return unchanged dropdown
+
+def load_preset(preset_name):
+    """Loads settings from a preset JSON file and returns updates for UI components."""
+    print(f"[Presets] Attempting to load preset: {preset_name}")
+    preset_path = PRESET_DIR / f"{preset_name}.json"
+
+    if not preset_path.exists():
+        print(f"[Error][Presets] Preset file not found: {preset_path}")
+        gr.Error(f"Preset '{preset_name}' not found.")
+        # Return updates that do nothing (empty list or list of Nones?)
+        # Let's return Nones, assuming len(SETTING_COMPONENTS_VARS) is correct
+        return [None] * len(SETTING_COMPONENTS_VARS) # Must return list of correct length
+
+    try:
+        with open(preset_path, 'r', encoding='utf-8') as f:
+            loaded_settings = json.load(f)
+        print(f"[Presets] Preset '{preset_name}' loaded successfully.")
+        # --- ADDED ---
+        save_last_used_preset(preset_name) # Update last used preset on load
+        # -----------
+
+        updates = []
+        for var_name in SETTING_COMPONENTS_VARS:
+            if var_name in loaded_settings:
+                updates.append(gr.update(value=loaded_settings[var_name]))
+            else:
+                # If a setting from the current UI is missing in the preset file,
+                # don't update it (keep its current value).
+                print(f"[Warning][Presets] Setting '{var_name}' not found in preset '{preset_name}'. Keeping current value.")
+                updates.append(gr.update()) # Send an empty update
+
+        # Special handling for VRAM dropdown -> textbox link
+        # Find the index of the vram_preset_dropdown and vram_custom_value_input
+        try:
+            vram_preset_idx = SETTING_COMPONENTS_VARS.index("vram_preset_dropdown")
+            vram_custom_idx = SETTING_COMPONENTS_VARS.index("vram_custom_value_input")
+
+            # Get the loaded preset name
+            loaded_vram_preset_name = loaded_settings.get("vram_preset_dropdown")
+
+            # If the preset name exists, update the custom textbox accordingly
+            if loaded_vram_preset_name in VRAM_PRESETS:
+                 expected_custom_value = VRAM_PRESETS[loaded_vram_preset_name]
+                 # Update the custom value update object in the list
+                 updates[vram_custom_idx] = gr.update(value=expected_custom_value)
+                 print(f"[Presets] Updated VRAM custom value based on loaded preset '{loaded_vram_preset_name}'")
+            else:
+                 # If the loaded preset name is invalid, maybe keep the existing custom value?
+                 print(f"[Warning][Presets] Loaded VRAM preset name '{loaded_vram_preset_name}' not found in VRAM_PRESETS. Custom value might be incorrect.")
+                 # We already added an update for vram_custom_value_input based on the file,
+                 # so we might leave it as is, or force it to None/empty?
+                 # For now, leave the value loaded from the file, even if potentially inconsistent.
+
+        except ValueError:
+            print("[Warning][Presets] Could not find VRAM dropdown/textbox indices. Skipping VRAM link update.")
+
+        gr.Info(f"Preset '{preset_name}' loaded.")
+        return updates
+
+    except Exception as e:
+        print(f"[Error][Presets] Failed to load preset '{preset_name}': {e}")
+        traceback.print_exc()
+        gr.Error(f"Failed to load preset '{preset_name}': {e}")
+        # Return updates that do nothing
+        return [None] * len(SETTING_COMPONENTS_VARS)
+
+# --- End Core Preset Save/Load Functions ---
 
 def calculate_frames(duration_sec, fps):
     """Calculates the frame count needed for the pipeline (4k+1 format)."""
@@ -1134,6 +1362,27 @@ with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V1)", theme
                  batch_start_btn = gr.Button("Start Batch Process", variant="primary")
                  # Cancel button is shared
 
+
+            # --- Presets Section ---
+            with gr.Group(): # Group preset elements visually
+                gr.Markdown("## 4. Presets")
+                initial_presets = get_preset_files()
+                # --- MODIFIED ---
+                # last_used_preset = get_latest_preset_name() # Removed
+                initial_preset_name = load_last_used_preset() # Load persistent setting
+                preset_dropdown = gr.Dropdown(
+                    choices=initial_presets,
+                    # value=last_used_preset, # Use loaded initial name
+                    value=initial_preset_name,
+                    label="Load Preset",
+                    info="Select a preset to load its settings."
+                )
+                # --- END MODIFIED ---
+                with gr.Row():
+                    preset_name_input = gr.Textbox(label="Save Preset As", placeholder="Enter new preset name...")
+                    save_preset_btn = gr.Button("Save Current Settings")
+            # --- End Presets Section ---
+
     # --- Event Handling ---
 
     # Single Generation Button
@@ -1172,6 +1421,45 @@ with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V1)", theme
          outputs=video_output # Show last generated batch video
     )
 
+    # --- Populate the Component List for Presets ---
+    # This MUST come AFTER all the components listed in SETTING_COMPONENTS_VARS are defined.
+    # Ensure the order here EXACTLY matches the order in SETTING_COMPONENTS_VARS.
+    SETTING_COMPONENTS = [
+        # Left Column
+        prompt_input, negative_prompt_input,
+        torch_dtype_dropdown, tiled_vae_checkbox,
+        width_input, height_input, duration_input, fps_input, num_generations_input,
+        prompt_cfg_scale, audio_cfg_scale, audio_weight,
+        inference_steps, seed_input, random_seed_checkbox,
+        sigma_shift, denoising_strength, save_video_quality, save_metadata_checkbox,
+        vram_preset_dropdown, vram_custom_value_input, # Include both VRAM controls
+        tile_size_h_input, tile_size_w_input, tile_stride_h_input, tile_stride_w_input,
+        # Batch Tab (Add corresponding variables if included in VARS list)
+        # batch_input_folder_input, batch_output_folder_input,
+        # batch_skip_existing_checkbox, batch_use_gradio_audio_checkbox, batch_use_gradio_prompt_checkbox,
+    ]
+    # Now link the global variable inside the functions to this list's variable names
+    # (This seems redundant, let's modify save/load to directly use SETTING_COMPONENTS_VARS)
+    # We already defined SETTING_COMPONENTS_VARS globally. Save/Load will use that.
+
+    # --- Preset Event Handling ---
+    save_preset_btn.click(
+        fn=save_preset,
+        # Input the name first, then unpack all component values
+        inputs=[preset_name_input] + SETTING_COMPONENTS,
+        # Output updates the preset dropdown
+        outputs=[preset_dropdown]
+    )
+
+    # Load preset when dropdown changes OR when explicitly loaded (if we add a load button)
+    # For simplicity, we'll just load when the dropdown changes.
+    preset_dropdown.change(
+        fn=load_preset,
+        inputs=[preset_dropdown],
+        # Outputs is the list of components to update
+        outputs=SETTING_COMPONENTS
+    )
+
     # Universal Cancel Button
     # It calls the handle_cancel function *immediately* to set flags
     # And uses `cancels` to signal Gradio to interrupt the running events
@@ -1191,6 +1479,25 @@ with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V1)", theme
 
     # Open Output Folder Button
     open_folder_btn.click(fn=open_folder, inputs=None, outputs=None)
+
+    # --- NEW: Function to Apply Initial Settings on App Load ---
+    def apply_initial_settings():
+        """Loads the last used preset when the app starts."""
+        preset_to_load = load_last_used_preset()
+        print(f"[Startup] Attempting to apply initial preset: {preset_to_load}")
+        try:
+            # load_preset now returns the list of updates for SETTING_COMPONENTS
+            updates = load_preset(preset_to_load)
+            print(f"[Startup] Successfully applied initial preset: {preset_to_load}")
+            return updates
+        except Exception as e:
+            print(f"[Error][Startup] Failed during initial preset application for '{preset_to_load}': {e}")
+            # Return list of Nones to avoid errors, UI keeps defaults
+            return [None] * len(SETTING_COMPONENTS)
+
+    # --- NEW: Trigger the initial preset load ---
+    demo.load(apply_initial_settings, inputs=None, outputs=SETTING_COMPONENTS)
+    # ----------------------------------------------
 
 def get_available_drives():
     """Detect available drives on the system regardless of OS"""
@@ -1220,6 +1527,11 @@ if __name__ == "__main__":
     args, unknown = parser.parse_known_args()
 
     share_flag = args.share
+
+    # --- Initialize Presets ---
+    create_default_preset_if_missing()
+    # (Initial preset list and selection are handled inside gr.Blocks now)
+    # --- Load last used preset name is handled by dropdown init and demo.load ---
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     TEMP_AUDIO_DIR.mkdir(parents=True, exist_ok=True) # Create temp audio dir

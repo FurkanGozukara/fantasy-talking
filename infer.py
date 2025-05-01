@@ -229,55 +229,78 @@ def main(
         # Filenaming strategy depends on 'output_base_name'
         output_base_name_arg = args.get('output_base_name') # For batch mode override
         save_metadata = args.get('save_metadata', False) # Check if metadata saving is enabled
+        # Get generation index info early for naming
+        generation_index = args.get('generation_index', 1)
+        # total_generations = args.get('total_generations', 1) # No longer needed directly for naming logic here
 
         base_name = ""
         save_path = None
         metadata_path = None
+        base_name_with_gen = "" # Will hold the final base name including generation suffix
 
         if output_base_name_arg:
-            # Batch mode: Use the provided stem directly
-            base_name = output_base_name_arg
-            print(f"{log_prefix} Using provided base name for batch mode: {base_name}")
-            save_path = output_dir / f"{base_name}.mp4"
-            if save_metadata:
-                 metadata_path = output_dir / f"{base_name}.txt"
-            # Skip check is handled in the calling function (secourses_app.py)
-            if save_path.exists():
-                 print(f"{log_prefix} Info: Output file {save_path} already exists (batch mode). FFmpeg will overwrite.")
+            # Batch mode: Use the provided stem. Append suffix ONLY if multiple variations are being generated for this item.
+            base_name = output_base_name_arg # The core stem
+            total_variations_for_item = args.get('total_generations', 1) # Get the variation count for *this* item
+            current_variation_index = args.get('generation_index', 1) # Get the index for *this* variation
+
+            if total_variations_for_item > 1:
+                # Multiple variations requested for this input image, so add suffix
+                base_name_with_gen = f"{base_name}_{current_variation_index:04d}"
+                print(f"{log_prefix} Batch mode (multi-variation): Using suffixed name: {base_name_with_gen}")
+            else:
+                # Only one variation requested for this input image, use stem directly
+                base_name_with_gen = base_name
+                print(f"{log_prefix} Batch mode (single variation): Using direct stem name: {base_name_with_gen}")
+
         else:
-            # Single/Sequential mode: Find the next available 000X number
-            print(f"{log_prefix} Determining sequential output filename (e.g., 0001.mp4)...")
+            # Single/Sequential mode: Find the next available 000X number for the base
+            print(f"{log_prefix} Determining sequential output filename base (e.g., 0001)...")
             sequence_num = 1
             while True:
-                base_name = f"{sequence_num:04d}"
-                potential_save_path = output_dir / f"{base_name}.mp4"
-                potential_metadata_path = output_dir / f"{base_name}.txt" if save_metadata else None
+                potential_base_name = f"{sequence_num:04d}" # This is the core sequence number
+                # Check if *any* file starting with this base exists (ignoring gen suffix for now)
+                # This prevents using '0002' if '0001_0001.mp4' exists but '0001_0002.mp4' doesn't
+                # A simple check is to see if the base itself exists as a video or metadata
+                # (A more robust check might glob for potential_base_name + "_*.mp4")
+                check_vid = output_dir / f"{potential_base_name}.mp4"
+                check_meta = output_dir / f"{potential_base_name}.txt"
+                check_vid_suffixed = output_dir / f"{potential_base_name}_0001.mp4" # Check first possible suffixed name
+                check_meta_suffixed = output_dir / f"{potential_base_name}_0001.txt"
 
-                video_exists = potential_save_path.exists()
-                metadata_exists = potential_metadata_path is not None and potential_metadata_path.exists()
-
-                if not video_exists and not metadata_exists:
-                    save_path = potential_save_path
-                    metadata_path = potential_metadata_path # Will be None if save_metadata is False
-                    print(f"{log_prefix} Using unique sequential base name: {base_name}")
-                    break
-
-                # Log why we are skipping this number
-                reason = []
-                if video_exists: reason.append(f"video '{base_name}.mp4'")
-                if metadata_exists: reason.append(f"metadata '{base_name}.txt'")
-                #print(f"{log_prefix} Skipping sequence {sequence_num}: {' and '.join(reason)} already exist(s).")
+                if not check_vid.exists() and not check_meta.exists() and not check_vid_suffixed.exists() and not check_meta_suffixed.exists() :
+                     base_name = potential_base_name
+                     print(f"{log_prefix} Using unique sequential base name: {base_name}")
+                     break # Found a base number that hasn't been used yet
 
                 sequence_num += 1
                 if sequence_num > 99999: # Increased safety break limit
-                    raise RuntimeError(f"{log_prefix} Could not find a unique filename after {sequence_num-1} attempts in {output_dir}. Please clean the directory or increase the limit.")
+                    raise RuntimeError(f"{log_prefix} Could not find an unused sequential base filename number after {sequence_num-1} attempts in {output_dir}.")
 
-        if not save_path: # Safety check
-             raise RuntimeError(f"{log_prefix} Failed to determine a valid output save path.")
+            # Now, always append the current generation index to the determined base name
+            base_name_with_gen = f"{base_name}_{generation_index:04d}"
+            print(f"{log_prefix} Using final name with generation index: {base_name_with_gen}")
 
-        # Define temporary path using the determined base_name
+            # --- Check for existence of the *specific* suffixed filename ---
+            # This check prevents overwriting if the user runs the *same* single generation again
+            # It's less critical if sequential finding logic above is robust, but adds safety.
+            potential_save_path = output_dir / f"{base_name_with_gen}.mp4"
+            potential_metadata_path = output_dir / f"{base_name_with_gen}.txt" if save_metadata else None
+            if potential_save_path.exists() or (potential_metadata_path and potential_metadata_path.exists()):
+                 raise FileExistsError(f"{log_prefix} Target output file '{base_name_with_gen}' already exists. Choose a different seed/settings or clear output.")
+
+
+        # --- Define paths using the final base_name_with_gen ---
+        if not base_name_with_gen: # Safety check
+            raise RuntimeError(f"{log_prefix} Failed to determine a valid base_name_with_gen.")
+
+        save_path = output_dir / f"{base_name_with_gen}.mp4"
+        if save_metadata:
+            metadata_path = output_dir / f"{base_name_with_gen}.txt"
+
+        # Define temporary path using the determined base_name_with_gen
         # Add timestamp and process ID for better uniqueness during parallel runs (though UI prevents this)
-        tmp_suffix = f"tmp_{base_name}_{int(time.time())}_{os.getpid()}.mp4"
+        tmp_suffix = f"tmp_{base_name_with_gen}_{int(time.time())}_{os.getpid()}.mp4"
         save_path_tmp = output_dir / tmp_suffix
 
         print(f"{log_prefix} Final Save Path: {save_path}")
@@ -497,8 +520,10 @@ def main(
         video_array = np.stack([np.array(frame.convert("RGB")) for frame in video_frames_pil])
         # Expected shape: (T, H, W, C)
         print(f"{log_prefix} Video array created with shape: {video_array.shape}, dtype: {video_array.dtype}")
-        if video_array.shape[0] != num_frames:
-             print(f"{log_prefix} Warning: Number of frames in array ({video_array.shape[0]}) doesn't match requested ({num_frames}).")
+        # Allow slight variations due to 4k+1 calculation potentially adding frames
+        # if abs(video_array.shape[0] - num_frames) > 1: # Allow diff of 0 or 1 frame perhaps?
+        #     print(f"{log_prefix} Warning: Number of frames in array ({video_array.shape[0]}) differs significantly from requested ({num_frames}).")
+        # Or simply trust the pipeline output length
         if video_array.shape[1] != height or video_array.shape[2] != width:
              print(f"{log_prefix} Warning: Frame dimensions ({video_array.shape[1]}x{video_array.shape[2]}) don't match requested ({height}x{width}).")
 
@@ -512,7 +537,8 @@ def main(
     saved_audio_path_str = None # Track path for metadata
     try:
         audio_path_obj = Path(audio_path)
-        used_audio_filename = f"{base_name}{audio_path_obj.suffix}"
+        # Use base_name_with_gen which correctly includes suffix only when needed
+        used_audio_filename = f"{base_name_with_gen}{audio_path_obj.suffix}"
         used_audio_dest_path = USED_AUDIO_DIR / used_audio_filename
         shutil.copy2(audio_path, used_audio_dest_path) # copy2 preserves metadata
         saved_audio_path_str = str(used_audio_dest_path.resolve())
@@ -627,7 +653,7 @@ def main(
                 "generation_wall_time_seconds": round(generation_duration_wall.total_seconds(), 3),
                 "output_video_file": save_path.name,
                 "output_metadata_file": metadata_path.name,
-                "base_name": base_name, # The core name (e.g., 0001 or image_stem)
+                "base_name_with_gen": base_name_with_gen, # The final name including suffix
                 "input_image_file": Path(args['image_path']).name,
                 "input_audio_file": Path(args['audio_path']).name,
                 "saved_input_audio_copy": saved_audio_path_str, # <<< Added path to copied audio
