@@ -1044,7 +1044,7 @@ with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V1)", theme
 
             gr.Examples(
                 examples=[
-                    ["assets/images/woman.png", "assets/audios/woman.wav", "A woman is talking."]
+                    ["assets/images/man.png", "assets/audios/man.wav", "A person speaking animatedly, using expressive hand gestures and nodding their head, medium shot."]
                 ],
                 inputs=[image_input, audio_input, prompt_input],
                 label="Examples (Image, Audio, Prompt)"
