@@ -1275,7 +1275,7 @@ def handle_cancel():
 with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V1)", theme=gr.themes.Soft()) as demo:
     gr.Markdown(
         """
-    # FantasyTalking: Realistic Talking Portrait Generation SECourses App V8 - https://www.patreon.com/posts/127855145
+    # FantasyTalking: Realistic Talking Portrait Generation SECourses App V9 - https://www.patreon.com/posts/127855145
     Generate a talking head video from an image and audio, or process a batch of images.
     [GitHub](https://github.com/Fantasy-AMAP/fantasy-talking) | [arXiv Paper](https://arxiv.org/abs/2504.04842)
     """
@@ -1385,7 +1385,7 @@ with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V1)", theme
                 process_btn = gr.Button("Generate Single Video", variant="primary", scale=2)
                 cancel_btn = gr.Button("Cancel All", variant="stop", scale=1) # Single cancel button
             video_output = gr.Video(label="Generated Video Output")
-            open_folder_btn = gr.Button("Open Output Folder")
+            open_folder_btn = gr.Button("Open Outputs Folder")
 
             with gr.Accordion("Batch Processing", open=True):
                  gr.Markdown(

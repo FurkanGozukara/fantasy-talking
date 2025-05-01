@@ -229,86 +229,38 @@ def main(
         # Filenaming strategy depends on 'output_base_name'
         output_base_name_arg = args.get('output_base_name') # For batch mode override
         save_metadata = args.get('save_metadata', False) # Check if metadata saving is enabled
-        # Get generation index info early for naming
+        # Get generation index info early for naming (still needed for logging and suffix)
         generation_index = args.get('generation_index', 1)
-        # total_generations = args.get('total_generations', 1) # No longer needed directly for naming logic here
+        total_generations = args.get('total_generations', 1) # Used for batch suffix logic
 
-        base_name = ""
+        # Initialize path variables - will be fully defined later
+        base_name = None
+        base_name_with_gen = None
         save_path = None
         metadata_path = None
-        base_name_with_gen = "" # Will hold the final base name including generation suffix
+        save_path_tmp = None
+        used_audio_filename = None
+        saved_audio_path_str = None
 
         if output_base_name_arg:
-            # Batch mode: Use the provided stem. Append suffix ONLY if multiple variations are being generated for this item.
+            # Batch mode: Determine base name early using the provided stem.
+            # Suffix is added based on variation count for the *item*.
             base_name = output_base_name_arg # The core stem
-            total_variations_for_item = args.get('total_generations', 1) # Get the variation count for *this* item
-            current_variation_index = args.get('generation_index', 1) # Get the index for *this* variation
+            total_variations_for_item = total_generations # In batch, total_generations IS the variation count for the item
+            current_variation_index = generation_index # In batch, generation_index IS the variation index
 
             if total_variations_for_item > 1:
                 # Multiple variations requested for this input image, so add suffix
                 base_name_with_gen = f"{base_name}_{current_variation_index:04d}"
-                print(f"{log_prefix} Batch mode (multi-variation): Using suffixed name: {base_name_with_gen}")
+                print(f"{log_prefix} Batch mode (multi-variation): Determined base name with suffix: {base_name_with_gen}")
             else:
                 # Only one variation requested for this input image, use stem directly
                 base_name_with_gen = base_name
-                print(f"{log_prefix} Batch mode (single variation): Using direct stem name: {base_name_with_gen}")
-
-        else:
-            # Single/Sequential mode: Find the next available 000X number for the base
-            print(f"{log_prefix} Determining sequential output filename base (e.g., 0001)...")
-            sequence_num = 1
-            while True:
-                potential_base_name = f"{sequence_num:04d}" # This is the core sequence number
-                # Check if *any* file starting with this base exists (ignoring gen suffix for now)
-                # This prevents using '0002' if '0001_0001.mp4' exists but '0001_0002.mp4' doesn't
-                # A simple check is to see if the base itself exists as a video or metadata
-                # (A more robust check might glob for potential_base_name + "_*.mp4")
-                check_vid = output_dir / f"{potential_base_name}.mp4"
-                check_meta = output_dir / f"{potential_base_name}.txt"
-                check_vid_suffixed = output_dir / f"{potential_base_name}_0001.mp4" # Check first possible suffixed name
-                check_meta_suffixed = output_dir / f"{potential_base_name}_0001.txt"
-
-                if not check_vid.exists() and not check_meta.exists() and not check_vid_suffixed.exists() and not check_meta_suffixed.exists() :
-                     base_name = potential_base_name
-                     print(f"{log_prefix} Using unique sequential base name: {base_name}")
-                     break # Found a base number that hasn't been used yet
-
-                sequence_num += 1
-                if sequence_num > 99999: # Increased safety break limit
-                    raise RuntimeError(f"{log_prefix} Could not find an unused sequential base filename number after {sequence_num-1} attempts in {output_dir}.")
-
-            # Now, always append the current generation index to the determined base name
-            base_name_with_gen = f"{base_name}_{generation_index:04d}"
-            print(f"{log_prefix} Using final name with generation index: {base_name_with_gen}")
-
-            # --- Check for existence of the *specific* suffixed filename ---
-            # This check prevents overwriting if the user runs the *same* single generation again
-            # It's less critical if sequential finding logic above is robust, but adds safety.
-            potential_save_path = output_dir / f"{base_name_with_gen}.mp4"
-            potential_metadata_path = output_dir / f"{base_name_with_gen}.txt" if save_metadata else None
-            if potential_save_path.exists() or (potential_metadata_path and potential_metadata_path.exists()):
-                 raise FileExistsError(f"{log_prefix} Target output file '{base_name_with_gen}' already exists. Choose a different seed/settings or clear output.")
+                print(f"{log_prefix} Batch mode (single variation): Determined direct stem name: {base_name_with_gen}")
+        # --- Single/Sequential mode name determination moved later ---
 
 
-        # --- Define paths using the final base_name_with_gen ---
-        if not base_name_with_gen: # Safety check
-            raise RuntimeError(f"{log_prefix} Failed to determine a valid base_name_with_gen.")
-
-        save_path = output_dir / f"{base_name_with_gen}.mp4"
-        if save_metadata:
-            metadata_path = output_dir / f"{base_name_with_gen}.txt"
-
-        # Define temporary path using the determined base_name_with_gen
-        # Add timestamp and process ID for better uniqueness during parallel runs (though UI prevents this)
-        tmp_suffix = f"tmp_{base_name_with_gen}_{int(time.time())}_{os.getpid()}.mp4"
-        save_path_tmp = output_dir / tmp_suffix
-
-        print(f"{log_prefix} Final Save Path: {save_path}")
-        if metadata_path:
-            print(f"{log_prefix} Metadata Save Path: {metadata_path}")
-        print(f"{log_prefix} Temporary Video Path: {save_path_tmp}")
-
-        # Extract other parameters
+        # Extract other parameters (keep early for validation/processing)
         num_frames = args['num_frames']
         fps = args['fps']
         audio_path = args['audio_path']
@@ -532,14 +484,72 @@ def main(
         traceback.print_exc()
         raise # Re-raise critical error
 
+    # --- Determine Filename for Single/Sequential Mode & Define All Paths ---
+    print(f"{log_prefix} Determining final output paths...")
+    audio_path_obj = Path(audio_path) # Need suffix info
+
+    if not output_base_name_arg:
+        # Single/Sequential mode: Find the next available 000X number just before saving temp/audio copy
+        print(f"{log_prefix} Single mode: Finding next available sequential base name...")
+        sequence_num = 1
+        while True:
+            potential_base_name = f"{sequence_num:04d}"
+            # Check if *any* file starting with this base name + generation index exists
+            # Check against the specific suffixed name we intend to use
+            potential_final_video_path = output_dir / f"{potential_base_name}_{generation_index:04d}.mp4"
+            potential_final_meta_path = output_dir / f"{potential_base_name}_{generation_index:04d}.txt"
+            # Also check if the base name *without* suffix exists (in case of old naming or single-gen runs)
+            potential_base_video_path = output_dir / f"{potential_base_name}.mp4"
+            potential_base_meta_path = output_dir / f"{potential_base_name}.txt"
+
+            if not potential_final_video_path.exists() and \
+               not (save_metadata and potential_final_meta_path.exists()) and \
+               not potential_base_video_path.exists() and \
+               not (save_metadata and potential_base_meta_path.exists()):
+                base_name = potential_base_name
+                # --- Logic change: Decide suffix based on total_generations --- #
+                if total_generations == 1:
+                    base_name_with_gen = base_name # No suffix if only 1 generation requested
+                    print(f"{log_prefix} Single mode (1 gen): Found unique base name '{base_name}', using final name: '{base_name_with_gen}'")
+                else:
+                    # Always append the current generation index if multiple generations requested
+                    base_name_with_gen = f"{base_name}_{generation_index:04d}"
+                    print(f"{log_prefix} Single mode (>1 gen): Found unique base name '{base_name}', using final name with suffix: '{base_name_with_gen}'")
+                # --- End Logic change ---
+                break # Found a suitable base name
+
+            sequence_num += 1
+            if sequence_num > 99999: # Increased safety break limit
+                raise RuntimeError(f"{log_prefix} Could not find an unused sequential base filename number after {sequence_num-1} attempts in {output_dir}.")
+
+    # --- Define paths using the final base_name_with_gen (determined now for both modes) ---
+    if not base_name_with_gen: # Safety check
+        raise RuntimeError(f"{log_prefix} Failed to determine a valid base_name_with_gen.")
+
+    save_path = output_dir / f"{base_name_with_gen}.mp4"
+    if save_metadata:
+        metadata_path = output_dir / f"{base_name_with_gen}.txt"
+
+    # Define temporary path using the determined base_name_with_gen
+    tmp_suffix = f"tmp_{base_name_with_gen}_{int(time.time())}_{os.getpid()}.mp4"
+    save_path_tmp = output_dir / tmp_suffix
+
+    # Define the name for the copied audio file
+    used_audio_filename = f"{base_name_with_gen}{audio_path_obj.suffix}"
+    used_audio_dest_path = USED_AUDIO_DIR / used_audio_filename # Define the full destination path here
+
+    print(f"{log_prefix} Final Save Path: {save_path}")
+    if metadata_path:
+        print(f"{log_prefix} Metadata Save Path: {metadata_path}")
+    print(f"{log_prefix} Temporary Video Path: {save_path_tmp}")
+    print(f"{log_prefix} Copied Input Audio Path: {used_audio_dest_path}")
+    # --- End Filename Determination ---
+
+
     # --- Save Input Audio Copy --- #
-    # Do this *before* potentially failing FFmpeg step
+    # Do this *before* potentially failing FFmpeg step, using the path defined above
     saved_audio_path_str = None # Track path for metadata
     try:
-        audio_path_obj = Path(audio_path)
-        # Use base_name_with_gen which correctly includes suffix only when needed
-        used_audio_filename = f"{base_name_with_gen}{audio_path_obj.suffix}"
-        used_audio_dest_path = USED_AUDIO_DIR / used_audio_filename
         shutil.copy2(audio_path, used_audio_dest_path) # copy2 preserves metadata
         saved_audio_path_str = str(used_audio_dest_path.resolve())
         print(f"{log_prefix} Copied input audio to: {used_audio_dest_path}")
@@ -652,11 +662,11 @@ def main(
                 "generation_duration_seconds": round(generation_duration_perf, 3),
                 "generation_wall_time_seconds": round(generation_duration_wall.total_seconds(), 3),
                 "output_video_file": save_path.name,
-                "output_metadata_file": metadata_path.name,
+                "output_metadata_file": metadata_path.name if metadata_path else "N/A", # Handle case where metadata is off
                 "base_name_with_gen": base_name_with_gen, # The final name including suffix
                 "input_image_file": Path(args['image_path']).name,
                 "input_audio_file": Path(args['audio_path']).name,
-                "saved_input_audio_copy": saved_audio_path_str, # <<< Added path to copied audio
+                "saved_input_audio_copy": saved_audio_path_str, # Path to copied audio
                 "generation_index": generation_index,
                 "total_generations": total_generations,
                 # Include relevant settings from the input args dictionary for reproducibility
