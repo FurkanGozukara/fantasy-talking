@@ -50,7 +50,7 @@ cancel_requested = False
 OUTPUT_DIR = Path("./outputs") # Define output directory consistently
 TEMP_AUDIO_DIR = Path("./temp_audios") # Define temporary audio directory
 
-DEFAULT_PROMPT = "A person is talking and making hand gestures."
+DEFAULT_PROMPT = "A person speaking animatedly, using expressive hand gestures and nodding their head, medium shot."
 DEFAULT_NEGATIVE_PROMPT = ""
 DEFAULT_WIDTH = 512
 DEFAULT_HEIGHT = 512
@@ -1004,7 +1004,7 @@ def handle_cancel():
 with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V1)", theme=gr.themes.Soft()) as demo:
     gr.Markdown(
         """
-    # FantasyTalking: Realistic Talking Portrait Generation SECourses App V4 - https://www.patreon.com/posts/127855145
+    # FantasyTalking: Realistic Talking Portrait Generation SECourses App V5 - https://www.patreon.com/posts/127855145
     Generate a talking head video from an image and audio, or process a batch of images.
     [GitHub](https://github.com/Fantasy-AMAP/fantasy-talking) | [arXiv Paper](https://arxiv.org/abs/2504.04842)
     """
