@@ -11,6 +11,7 @@ import random
 import time # Added for potential delays/checks
 import traceback # Added for detailed error logging
 import json # Added for batch processing prompt reading
+import uuid # Added for unique temporary filenames
 
 import gradio as gr
 import librosa
@@ -47,6 +48,7 @@ cancel_requested = False
 
 # --- Constants ---
 OUTPUT_DIR = Path("./outputs") # Define output directory consistently
+TEMP_AUDIO_DIR = Path("./temp_audios") # Define temporary audio directory
 
 DEFAULT_PROMPT = "A person is talking."
 DEFAULT_NEGATIVE_PROMPT = ""
@@ -309,26 +311,86 @@ def generate_video(
 
         print(f"[Validation] Inputs validated. Num Generations={num_generations}, Use Random Seed={use_random_seed}, Initial Seed={initial_seed}")
 
-        # --- Calculate Target Duration & Frames ---
+        # --- Audio Handling (Extraction if Video) ---
+        progress(0.15, desc="Processing audio input...")
+        original_audio_path = audio_path
+        audio_path_to_use = None
+        temp_audio_file = None
+        delete_temp_audio = False
+
+        # Check if input is a video file based on common video extensions
+        video_extensions = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.flv'}
+        input_audio_path_obj = Path(original_audio_path)
+        is_video = input_audio_path_obj.suffix.lower() in video_extensions
+
+        if is_video:
+            print(f"[Audio Proc] Input '{input_audio_path_obj.name}' detected as video. Extracting audio...")
+            # Generate a unique temporary filename for the extracted audio
+            temp_audio_filename = f"extracted_audio_{uuid.uuid4()}.wav"
+            temp_audio_file = TEMP_AUDIO_DIR / temp_audio_filename
+
+            # Construct the ffmpeg command
+            # -i: input file
+            # -vn: disable video recording (extract only audio)
+            # -acodec pcm_s16le: specify audio codec (WAV standard)
+            # -ar 44100: specify audio sample rate (adjust if needed)
+            # -ac 2: specify audio channels (stereo)
+            # -y: overwrite output file without asking
+            ffmpeg_command = [
+                'ffmpeg',
+                '-i', str(input_audio_path_obj.resolve()),
+                '-vn',
+                '-acodec', 'pcm_s16le', # Standard WAV codec
+                '-ar', '44100',        # Common sample rate
+                '-ac', '1',            # Force mono (often better for speech models)
+                '-y',
+                str(temp_audio_file.resolve())
+            ]
+            print(f"[Audio Proc] Running ffmpeg command: {' '.join(ffmpeg_command)}")
+            try:
+                process = subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True)
+                print(f"[Audio Proc] FFmpeg stdout: {process.stdout}")
+                print(f"[Audio Proc] FFmpeg stderr: {process.stderr}")
+                if not temp_audio_file.exists() or temp_audio_file.stat().st_size == 0:
+                     raise RuntimeError("FFmpeg finished but output file is missing or empty.")
+                print(f"[Audio Proc] Audio successfully extracted to: {temp_audio_file}")
+                audio_path_to_use = str(temp_audio_file.resolve())
+                delete_temp_audio = True # Mark for deletion later
+            except subprocess.CalledProcessError as e:
+                print(f"[Error][Audio Proc] FFmpeg failed with exit code {e.returncode}")
+                print(f"[Error][Audio Proc] FFmpeg stderr: {e.stderr}")
+                raise gr.Error(f"Failed to extract audio from video: {input_audio_path_obj.name}. Check ffmpeg installation and video file. Error: {e.stderr[:500]}...")
+            except Exception as e:
+                 print(f"[Error][Audio Proc] An unexpected error occurred during audio extraction: {e}")
+                 traceback.print_exc()
+                 raise gr.Error(f"Failed to process video input {input_audio_path_obj.name}. Error: {e}")
+        else:
+            print(f"[Audio Proc] Input '{input_audio_path_obj.name}' detected as audio. Using directly.")
+            audio_path_to_use = original_audio_path # Use the original audio path
+
+        # --- Calculate Target Duration & Frames (using audio_path_to_use) ---
         target_duration = duration_seconds
         try:
-            actual_audio_duration = librosa.get_duration(filename=audio_path)
-            print(f"[Audio Info] Actual audio duration: {actual_audio_duration:.2f}s")
+            # Use the potentially extracted audio path here
+            actual_audio_duration = librosa.get_duration(filename=audio_path_to_use)
+            print(f"[Audio Info] Effective audio duration (from '{Path(audio_path_to_use).name}'): {actual_audio_duration:.2f}s")
             if actual_audio_duration < duration_seconds:
-                gr.Warning(f"Requested duration ({duration_seconds}s) is longer than audio ({actual_audio_duration:.2f}s). Using audio duration.")
+                gr.Warning(f"Requested duration ({duration_seconds}s) is longer than effective audio ({actual_audio_duration:.2f}s). Using audio duration.")
                 target_duration = actual_audio_duration
             elif actual_audio_duration <= 0:
-                 raise ValueError("Audio duration is zero or negative.")
+                 raise ValueError("Effective audio duration is zero or negative.")
 
         except Exception as e:
-            print(f"[Error] Could not read audio file duration: {audio_path}. Error: {e}")
+            print(f"[Error] Could not read effective audio file duration: {audio_path_to_use}. Error: {e}")
             traceback.print_exc()
-            raise gr.Error(f"Could not read audio file: {Path(audio_path).name}. Please check the file. Error: {e}")
+            # Refer to the original input name in the error message
+            raise gr.Error(f"Could not read audio data from input '{input_audio_path_obj.name}'. Please check the file. Error: {e}")
 
         num_frames = calculate_frames(target_duration, fps)
         print(f"[Calculation] Target duration: {target_duration:.2f}s, Target FPS: {fps}, Calculated num_frames: {num_frames}")
         if num_frames <= 1:
-             raise gr.Error(f"Calculated number of frames is {num_frames}. This is too low, likely due to very short audio or low FPS. Minimum required effective frames > 1.")
+             # Refer to the original input name in the error message
+             raise gr.Error(f"Calculated number of frames for '{input_audio_path_obj.name}' is {num_frames}. Too low, check audio length/FPS.")
 
 
         # --- Prepare Paths and Folders ---
@@ -336,13 +398,15 @@ def generate_video(
         print(f"[File System] Ensured output directory exists: {OUTPUT_DIR}")
         try:
             image_path_abs = Path(image_path).resolve().as_posix()
-            audio_path_abs = Path(audio_path).resolve().as_posix()
+            # Use the potentially extracted audio path here
+            audio_path_abs = Path(audio_path_to_use).resolve().as_posix()
         except Exception as e:
              raise gr.Error(f"Invalid input file path provided. Error: {e}")
 
 
         # --- Model Loading / Reloading ---
-        progress(0.1, desc="Checking model status...")
+        # Use progress value 0.2 as audio processing is done
+        progress(0.2, desc="Checking model status...")
         num_persistent_param_in_dit = parse_persistent_params(vram_custom_value_input_param)
         torch_dtype = get_torch_dtype(torch_dtype_str)
 
@@ -510,6 +574,14 @@ def generate_video(
          gr.Error(f"An unexpected error occurred: {str(e)}") # Show error in UI
          return None # Indicate failure
     finally:
+        # --- Clean up temporary audio file if created ---
+        if delete_temp_audio and temp_audio_file and temp_audio_file.exists():
+            try:
+                temp_audio_file.unlink()
+                print(f"[Cleanup] Deleted temporary audio file: {temp_audio_file}")
+            except OSError as e:
+                print(f"[Warning][Cleanup] Failed to delete temporary audio file {temp_audio_file}: {e}")
+
         # --- Reset State ---
         # *** ADDED DEBUG PRINTS ***
         print(f"[State Check] Entering FINALLY block for generate_video. Current state: is_generating={is_generating}, is_cancelling={is_cancelling}, cancel_requested={cancel_requested}")
@@ -886,7 +958,7 @@ def handle_cancel():
 with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V1)", theme=gr.themes.Soft()) as demo:
     gr.Markdown(
         """
-    # FantasyTalking: Realistic Talking Portrait Generation SECourses App V1 - https://www.patreon.com/posts/127855145
+    # FantasyTalking: Realistic Talking Portrait Generation SECourses App V2 - https://www.patreon.com/posts/127855145
     Generate a talking head video from an image and audio, or process a batch of images.
     [GitHub](https://github.com/Fantasy-AMAP/fantasy-talking) | [arXiv Paper](https://arxiv.org/abs/2504.04842)
     """
@@ -898,7 +970,7 @@ with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V1)", theme
             gr.Markdown("## 1. Inputs (Single Generation)")
             with gr.Row():
                 image_input = gr.Image(label="Input Image", type="filepath", scale=1)
-                audio_input = gr.Audio(label="Input Audio (WAV/MP3)", type="filepath", scale=1) # Allow MP3
+                audio_input = gr.File(label="Input Audio or Video", file_types=["audio", ".wav", ".mp3", ".flac", "video", ".mp4", ".mov", ".avi", ".mkv"], type="filepath", scale=1)
 
             prompt_input = gr.Textbox(
                 label="Prompt", placeholder=DEFAULT_PROMPT, value=DEFAULT_PROMPT, lines=2,
@@ -1088,7 +1160,9 @@ if __name__ == "__main__":
     share_flag = args.share
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    TEMP_AUDIO_DIR.mkdir(parents=True, exist_ok=True) # Create temp audio dir
     print(f"Output directory: {OUTPUT_DIR.resolve()}")
+    print(f"Temporary audio directory: {TEMP_AUDIO_DIR.resolve()}") # Log temp dir
 
     demo.launch(inbrowser=True, share=share_flag,allowed_paths=get_available_drives()) # Added server_name for listen
 

@@ -10,5 +10,6 @@ diffsynth/schedulers/__pycache__/
 diffsynth/vram_management/__pycache__/
 models/
 output/
+temp_audios
 venv/
 outputs
