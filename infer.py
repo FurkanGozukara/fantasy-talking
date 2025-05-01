@@ -66,16 +66,44 @@ def load_models(
     # Load Wan I2V models
     print("[Model Loading] Loading Wan I2V models to CPU first...")
     model_manager = ModelManager(device="cpu") # Keep on CPU initially
+
+    # --- Determine Wan I2V model file and loading dtype based on pipeline's target dtype ---
+    target_pipeline_dtype = torch_dtype # This is the dtype passed from the app
+    wan_model_filename = ""
+    wan_loading_dtype = None
+
+    if target_pipeline_dtype in [torch.bfloat16, torch.float16]:
+        wan_model_filename = "wan21_i2v_720p_14B_fp16.safetensors"
+        wan_loading_dtype = torch_dtype
+        print(f"[Model Loading] Selected Wan I2V model for BF16/FP16 pipeline: {wan_model_filename} (loading as {torch_dtype})")
+    elif target_pipeline_dtype == torch.float8_e4m3fn:
+        wan_model_filename = "wan21_i2v_720p_14B_fp8_e4m3fn.safetensors"
+        wan_loading_dtype = torch_dtype # Load FP8 model as FP8
+        print(f"[Model Loading] Selected Wan I2V model for FP8 pipeline: {wan_model_filename} (loading as {torch_dtype})")
+    else:
+        # Fallback or error - defaulting to FP8 might be risky, but let's match previous behavior slightly safer
+        print(f"[Warning][Model Loading] Unsupported torch_dtype ({target_pipeline_dtype}) received. Defaulting to FP8 model. Behavior might be unexpected.")
+        wan_model_filename = "wan21_i2v_720p_14B_fp8_e4m3fn.safetensors"
+        wan_loading_dtype = torch.float16
+
+    if not wan_model_filename or not wan_loading_dtype:
+         # This should ideally not happen with the fallback, but good practice
+         raise ValueError(f"Could not determine Wan I2V model file or loading dtype for pipeline dtype: {target_pipeline_dtype}")
+
+    wan_model_path = os.path.join(wan_model_dir, wan_model_filename)
+    # ----------------------------------------------------------------------------------
+
     try:
         model_manager.load_models(
             [
-                # Ensure these paths are correct relative to your execution environment
-                os.path.join(wan_model_dir, "wan21_i2v_720p_14B_fp16.safetensors"),
+                # Dynamically determined Wan I2V model path
+                wan_model_path,
+                # Other models remain the same
                 os.path.join(wan_model_dir, "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"),
                 os.path.join(wan_model_dir, "models_t5_umt5-xxl-enc-bf16.pth"),
                 os.path.join(wan_model_dir, "Wan2.1_VAE.pth"),
             ],
-            torch_dtype=torch_dtype, # Load with target dtype even on CPU if possible
+            torch_dtype=wan_loading_dtype, # Use the determined dtype for loading this set
         )
     except Exception as e:
         print(f"[Error][Model Loading] Failed to load one or more Wan I2V models from {wan_model_dir}. Check paths and files.")
@@ -86,9 +114,14 @@ def load_models(
     print("[Model Loading] Wan I2V models loaded to CPU.")
     print("[Model Loading] Creating WanVideoPipeline...")
     try:
-        pipe = WanVideoPipeline.from_model_manager(
-            model_manager, torch_dtype=torch_dtype, device=device # Pipeline manages device movement
-        )
+        if target_pipeline_dtype is torch.bfloat16:
+            pipe = WanVideoPipeline.from_model_manager(
+                model_manager, torch_dtype=torch.bfloat16, device=device  # Pipeline manages device movement
+            )
+        else:
+            pipe = WanVideoPipeline.from_model_manager(
+                model_manager, torch_dtype=torch.float16, device=device  # Pipeline manages device movement
+            )
     except Exception as e:
         print(f"[Error][Model Loading] Failed to create WanVideoPipeline.")
         print(f"[Error][Model Loading] Details: {e}")
@@ -233,7 +266,7 @@ def main(
                 reason = []
                 if video_exists: reason.append(f"video '{base_name}.mp4'")
                 if metadata_exists: reason.append(f"metadata '{base_name}.txt'")
-                print(f"{log_prefix} Skipping sequence {sequence_num}: {' and '.join(reason)} already exist(s).")
+                #print(f"{log_prefix} Skipping sequence {sequence_num}: {' and '.join(reason)} already exist(s).")
 
                 sequence_num += 1
                 if sequence_num > 99999: # Increased safety break limit
@@ -362,7 +395,7 @@ def main(
             "cfg_scale": args['prompt_cfg_scale'],
             "audio_cfg_scale": args['audio_cfg_scale'],
             # Ensure audio features are on the correct device and dtype
-            "audio_proj": audio_proj_split.to(device=pipe.device, dtype=pipe.torch_dtype),
+            "audio_proj": audio_proj_split.to(device=pipe.device, dtype=torch.float16),
             "audio_context_lens": audio_context_lens,
             "latents_num_frames": latents_num_frames, # Pass calculated latent frames
             "denoising_strength": args.get('denoising_strength', 1.0), # Use .get for safety

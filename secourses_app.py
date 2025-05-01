@@ -92,10 +92,11 @@ VRAM_PRESETS = {
 VRAM_PRESET_DEFAULT = "24GB GPUs" # Adjusted default based on new names
 
 TORCH_DTYPES_STR = {
-    "bfloat16": torch.bfloat16,
-    "float16": torch.float16,
+    "BF16": torch.bfloat16,
+    "FP16": torch.float16,
+    "FP8": torch.float8_e4m3fn,
 }
-TORCH_DTYPE_DEFAULT = "bfloat16"
+TORCH_DTYPE_DEFAULT = "BF16"
 # ---------------
 
 
@@ -1004,7 +1005,7 @@ def handle_cancel():
 with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V1)", theme=gr.themes.Soft()) as demo:
     gr.Markdown(
         """
-    # FantasyTalking: Realistic Talking Portrait Generation SECourses App V5 - https://www.patreon.com/posts/127855145
+    # FantasyTalking: Realistic Talking Portrait Generation SECourses App V6 - https://www.patreon.com/posts/127855145
     Generate a talking head video from an image and audio, or process a batch of images.
     [GitHub](https://github.com/Fantasy-AMAP/fantasy-talking) | [arXiv Paper](https://arxiv.org/abs/2504.04842)
     """
@@ -1034,6 +1035,12 @@ with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V1)", theme
                 label="Negative Prompt", placeholder=DEFAULT_NEGATIVE_PROMPT, value=DEFAULT_NEGATIVE_PROMPT, lines=2,
                 info="Describe what NOT to generate. Used for single and batch."
             )
+            with gr.Row():
+                torch_dtype_dropdown = gr.Dropdown(
+                        choices=list(TORCH_DTYPES_STR.keys()), value=TORCH_DTYPE_DEFAULT, label="Model Loading Precision (BF16 Highest Quality, more RAM and VRAM), FP8 Lower Quality but lower RAM and VRAM",
+                        info="BF16 is recommended. But if you get errors due to limited RAM or VRAM use FP8. Requires model reload on change."
+                    )
+                tiled_vae_checkbox = gr.Checkbox(label="Enable Tiled VAE", value=True, info="Saves VRAM during decode, might be slightly slower.")
 
             gr.Examples(
                 examples=[
@@ -1090,12 +1097,7 @@ with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V1)", theme
                      )
                 # Link dropdown to textbox update
                 vram_preset_dropdown.change(fn=update_vram_textbox, inputs=vram_preset_dropdown, outputs=vram_custom_value_input)
-                with gr.Row():
-                    torch_dtype_dropdown = gr.Dropdown(
-                        choices=list(TORCH_DTYPES_STR.keys()), value=TORCH_DTYPE_DEFAULT, label="Computation Precision (dtype)",
-                        info="bfloat16 recommended if supported. Requires model reload on change."
-                    )
-                    tiled_vae_checkbox = gr.Checkbox(label="Enable Tiled VAE", value=True, info="Saves VRAM during decode, might be slightly slower.")
+
                 with gr.Group(visible=True) as tile_options: # Keep tile options always visible but respect checkbox
                     # Tiling options enabled/disabled based on checkbox in backend logic
                     with gr.Row():
