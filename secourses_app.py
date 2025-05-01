@@ -1298,7 +1298,7 @@ with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V1)", theme
             )
 
             prompt_input = gr.Textbox(
-                label="Prompt", placeholder=DEFAULT_PROMPT, value=DEFAULT_PROMPT, lines=2,
+                label="Prompt", placeholder=DEFAULT_PROMPT, value=DEFAULT_PROMPT, lines=5,
                 info="Describe the scene/action. Used for single gen or batch fallback."
             )
             negative_prompt_input = gr.Textbox(
