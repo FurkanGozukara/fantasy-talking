@@ -181,7 +181,7 @@ def get_default_settings():
         # "batch_use_gradio_prompt_checkbox": True,
         # <<< RIFE Defaults >>>
         "rife_mode_radio": "None",
-        "rife_max_fps_input": 30,
+        "rife_max_fps_input": 60,
     }
 
 def create_default_preset_if_missing():
@@ -302,8 +302,8 @@ def load_preset(preset_name):
                     print(f"[Warning][Presets] Setting '{var_name}' not found in preset '{preset_name}'. Using default 'None'.")
                     updates.append(gr.update(value="None")) # Default to "None" if missing
                 elif var_name == "rife_max_fps_input" and var_name not in loaded_settings:
-                    print(f"[Warning][Presets] Setting '{var_name}' not found in preset '{preset_name}'. Using default 30.")
-                    updates.append(gr.update(value=30)) # Default to 30 if missing
+                    print(f"[Warning][Presets] Setting '{var_name}' not found in preset '{preset_name}'. Using default 60.")
+                    updates.append(gr.update(value=60)) 
                 else:
                     updates.append(gr.update(value=setting_value))
             else:
@@ -1275,12 +1275,12 @@ with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V13)", them
                     info="Select FPS multiplication factor. 'None' disables RIFE."
                 )
                 rife_max_fps_input = gr.Number(
-                    value=30, # Default limit
+                    value=60, # Default limit
                     label="Max RIFE FPS Limit",
                     minimum=1,
                     step=1,
                     precision=0,
-                    info="Limit the final FPS after RIFE. E.g., 23fps * 2x = 46fps. If limit is 30, output will be 30fps."
+                    info="Limit the final FPS after RIFE. E.g., 23fps * 2x = 46fps. If limit is 60, output will be 60fps."
                 )
     # --- Event Handling ---
 
