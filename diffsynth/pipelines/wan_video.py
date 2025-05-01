@@ -258,6 +258,7 @@ class WanVideoPipeline(BasePipeline):
         progress_bar_cmd=tqdm,
         progress_bar_st=None,
         cancel_fn=None, # Added cancel_fn parameter
+        gradio_progress=None, # <<< Added gradio_progress parameter
         **kwargs,
     ):
         # Parameter check
@@ -330,6 +331,17 @@ class WanVideoPipeline(BasePipeline):
                     print("[Pipeline] Cancellation requested via cancel_fn.")
                     # Raise the specific error to be caught upstream
                     raise CancelledError("Video generation cancelled by pipeline check")
+                # ----------------------------- #
+
+                # --- Update Gradio Progress --- #
+                if gradio_progress is not None:
+                    progress_fraction = (progress_id + 1) / len(self.scheduler.timesteps)
+                    # Map diffusion progress (0-1) to a portion of the Gradio progress bar
+                    # Assuming diffusion takes up a significant portion, e.g., 70% (0.2 to 0.9)
+                    # This range matches how it's used in secourses_app.py's generate_video
+                    gradio_progress_value = 0.3 + progress_fraction * 0.6
+                    progress_desc = f"Denoising step {progress_id + 1}/{len(self.scheduler.timesteps)}"
+                    gradio_progress(gradio_progress_value, desc=progress_desc)
                 # ----------------------------- #
 
                 timestep = timestep.unsqueeze(0).to(

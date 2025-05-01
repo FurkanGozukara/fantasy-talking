@@ -10,6 +10,7 @@ import time # For calculating duration
 import json # For metadata saving and potentially prompt loading
 import pprint # For pretty printing dicts
 import traceback # For detailed error logging
+import shutil # <<< Added for file copying
 
 # import cv2 # No longer needed directly here
 import librosa # Keep for checking audio duration before processing
@@ -34,6 +35,10 @@ except ImportError:
         """Custom exception for cancellation (local definition)."""
         pass
 # ---------------------------------- #
+
+# --- Define Used Audios Directory --- #
+USED_AUDIO_DIR = Path("./used_audios")
+# ----------------------------------- #
 
 
 def load_models(
@@ -146,7 +151,8 @@ def main(
     fantasytalking: FantasyTalkingAudioConditionModel,
     wav2vec_processor: Wav2Vec2Processor,
     wav2vec: Wav2Vec2Model,
-    cancel_fn=None # Added cancel_fn parameter
+    cancel_fn=None, # Added cancel_fn parameter
+    gradio_progress=None # Added Gradio progress object parameter
     ):
     """Generates the video based on the provided arguments and loaded models."""
     start_time_global = datetime.now() # Record overall start time
@@ -182,6 +188,10 @@ def main(
         output_dir = Path(output_dir_str)
         output_dir.mkdir(parents=True, exist_ok=True)
         print(f"{log_prefix} Ensured output directory exists: {output_dir}")
+        # --- Ensure Used Audios Directory Exists --- #
+        USED_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+        print(f"{log_prefix} Ensured used audios directory exists: {USED_AUDIO_DIR}")
+        # ----------------------------------------- #
 
         # Filenaming strategy depends on 'output_base_name'
         output_base_name_arg = args.get('output_base_name') # For batch mode override
@@ -402,11 +412,12 @@ def main(
     video_frames_pil = None # Initialize variable
     pipeline_start_time = time.perf_counter()
     try:
-        # *** Pass cancel_fn and tqdm to the pipeline call ***
+        # *** Pass cancel_fn, tqdm, and gradio_progress to the pipeline call ***
         video_frames_pil = pipe(
             **pipe_kwargs,
             cancel_fn=cancel_fn,
-            progress_bar_cmd=tqdm # <<< Add this argument
+            progress_bar_cmd=tqdm, # <<< Pass tqdm for console progress
+            gradio_progress=gradio_progress # <<< Pass Gradio progress object
         )
         # *******************************************
         pipeline_duration = time.perf_counter() - pipeline_start_time
@@ -417,6 +428,14 @@ def main(
              # This case should ideally not happen if pipe returns correctly
              print(f"{log_prefix} Warning: Pipeline returned unexpected type or empty list: {type(video_frames_pil)}")
              raise ValueError("Pipeline did not return a list of PIL Image frames.")
+
+        # --- Replace First Frame with Input Image ---
+        if isinstance(video_frames_pil, list) and len(video_frames_pil) > 0:
+            print(f"{log_prefix} Replacing first generated frame with the input image.")
+            video_frames_pil[0] = image # 'image' is the resized input PIL Image
+        else:
+             print(f"{log_prefix} Warning: Cannot replace first frame as video_frames_pil is not a non-empty list.")
+        # ---------------------------------------------
 
     except CancelledError as e: # Catch the specific error from the pipeline
         pipeline_duration = time.perf_counter() - pipeline_start_time
@@ -454,6 +473,22 @@ def main(
         print(f"{log_prefix} !!! Error converting PIL frames to NumPy array: {e}")
         traceback.print_exc()
         raise # Re-raise critical error
+
+    # --- Save Input Audio Copy --- #
+    # Do this *before* potentially failing FFmpeg step
+    saved_audio_path_str = None # Track path for metadata
+    try:
+        audio_path_obj = Path(audio_path)
+        used_audio_filename = f"{base_name}{audio_path_obj.suffix}"
+        used_audio_dest_path = USED_AUDIO_DIR / used_audio_filename
+        shutil.copy2(audio_path, used_audio_dest_path) # copy2 preserves metadata
+        saved_audio_path_str = str(used_audio_dest_path.resolve())
+        print(f"{log_prefix} Copied input audio to: {used_audio_dest_path}")
+    except Exception as copy_e:
+        print(f"{log_prefix} !!! Warning: Failed to copy input audio {audio_path} to {used_audio_dest_path}: {copy_e}")
+        # Continue generation even if audio copy fails, but log it.
+        traceback.print_exc() # Log full traceback for the warning
+    # -------------------------- #
 
 
     # --- Save Temporary Video (using diffsynth's save_video or alternative) ---
@@ -562,6 +597,7 @@ def main(
                 "base_name": base_name, # The core name (e.g., 0001 or image_stem)
                 "input_image_file": Path(args['image_path']).name,
                 "input_audio_file": Path(args['audio_path']).name,
+                "saved_input_audio_copy": saved_audio_path_str, # <<< Added path to copied audio
                 "generation_index": generation_index,
                 "total_generations": total_generations,
                 # Include relevant settings from the input args dictionary for reproducibility

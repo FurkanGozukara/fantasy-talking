@@ -50,7 +50,7 @@ cancel_requested = False
 OUTPUT_DIR = Path("./outputs") # Define output directory consistently
 TEMP_AUDIO_DIR = Path("./temp_audios") # Define temporary audio directory
 
-DEFAULT_PROMPT = "A person is talking."
+DEFAULT_PROMPT = "A person is talking and making hand gestures."
 DEFAULT_NEGATIVE_PROMPT = ""
 DEFAULT_WIDTH = 512
 DEFAULT_HEIGHT = 512
@@ -503,9 +503,11 @@ def generate_video(
             # --- Execute Generation ---
             print(f"[Execution][Gen {current_gen_index}/{num_generations}] Calling infer.main...")
             try:
-                # *** Pass cancel_fn to main ***
+                # *** Pass cancel_fn and gradio_progress to main ***
                 output_video_path = main(
-                    args_dict, pipe, fantasytalking, wav2vec_processor, wav2vec, cancel_fn=cancel_fn
+                    args_dict, pipe, fantasytalking, wav2vec_processor, wav2vec,
+                    cancel_fn=cancel_fn,
+                    gradio_progress=progress
                 )
                 print(f"[Execution][Gen {current_gen_index}/{num_generations}] infer.main completed. Output: {output_video_path}")
                 # Update progress after successful generation
@@ -916,8 +918,12 @@ def process_batch(
             try:
                 # Add logging for the output directory being passed
                 print(f"[Execution][Batch] Calling infer.main for '{image_stem}' with output_dir: '{args_dict['output_dir']}'")
-                # Pass cancel_fn to main
-                last_output_path = main(args_dict, pipe, fantasytalking, wav2vec_processor, wav2vec, cancel_fn=cancel_fn)
+                # *** Pass cancel_fn and gradio_progress to main ***
+                last_output_path = main(
+                    args_dict, pipe, fantasytalking, wav2vec_processor, wav2vec,
+                    cancel_fn=cancel_fn,
+                    gradio_progress=progress
+                )
                 print(f"[Execution][Batch] Successfully processed item '{image_stem}'. Output: {last_output_path}")
                 processed_files_count += 1
             except CancelledError as ce:
@@ -998,7 +1004,7 @@ def handle_cancel():
 with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V1)", theme=gr.themes.Soft()) as demo:
     gr.Markdown(
         """
-    # FantasyTalking: Realistic Talking Portrait Generation SECourses App V3 - https://www.patreon.com/posts/127855145
+    # FantasyTalking: Realistic Talking Portrait Generation SECourses App V4 - https://www.patreon.com/posts/127855145
     Generate a talking head video from an image and audio, or process a batch of images.
     [GitHub](https://github.com/Fantasy-AMAP/fantasy-talking) | [arXiv Paper](https://arxiv.org/abs/2504.04842)
     """
