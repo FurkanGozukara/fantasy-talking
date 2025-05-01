@@ -395,7 +395,7 @@ def main(
             "cfg_scale": args['prompt_cfg_scale'],
             "audio_cfg_scale": args['audio_cfg_scale'],
             # Ensure audio features are on the correct device and dtype
-            "audio_proj": audio_proj_split.to(device=pipe.device, dtype=torch.float16),
+            "audio_proj": audio_proj_split.to(device=pipe.device, dtype=torch.bfloat16),
             "audio_context_lens": audio_context_lens,
             "latents_num_frames": latents_num_frames, # Pass calculated latent frames
             "denoising_strength": args.get('denoising_strength', 1.0), # Use .get for safety
