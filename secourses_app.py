@@ -733,6 +733,9 @@ def generate_video(
         print(f"[State Check] Exiting FINALLY block for generate_video. Flags after reset: is_generating={is_generating}, is_cancelling={is_cancelling}, cancel_requested={cancel_requested}")
         # Optional: torch.cuda.empty_cache()
 
+    # <<< Explicitly return the last successful video path >>>
+    return output_video_path
+
 # --- Function to Handle Video Upload and Audio Extraction ---
 # (No changes needed in handle_video_upload)
 def handle_video_upload(video_file_path, progress=gr.Progress()):
@@ -1122,10 +1125,10 @@ def handle_cancel():
 
 
 # --- Gradio UI Definition ---
-with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V12)", theme=gr.themes.Soft()) as demo: # Updated title
+with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V13)", theme=gr.themes.Soft()) as demo: # Updated title
     gr.Markdown(
         """
-    # FantasyTalking: Realistic Talking Portrait Generation SECourses App V12 - https://www.patreon.com/posts/127855145
+    # FantasyTalking: Realistic Talking Portrait Generation SECourses App V13 - https://www.patreon.com/posts/127855145
     Generate a talking head video from an image and audio, or process a batch of images. Supports multiple prompts per generation.
     [GitHub](https://github.com/Fantasy-AMAP/fantasy-talking) | [arXiv Paper](https://arxiv.org/abs/2504.04842)
     """

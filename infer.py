@@ -638,8 +638,15 @@ def main(
 
 
     total_duration = time.perf_counter() - start_time_perf
+    final_output_path_to_return = save_path # Default to the path after ffmpeg
+    if rife_applied and rife_output_path_final and rife_output_path_final.exists():
+        final_output_path_to_return = rife_output_path_final # Update to RIFE path if successful
+        print(f"{log_prefix} Returning RIFE output path: {final_output_path_to_return}")
+    else:
+        print(f"{log_prefix} Returning original/FFmpeg output path: {final_output_path_to_return}")
+
     print(f"{log_prefix} ===== Finished Generation Task (Total duration: {total_duration:.2f}s) =====")
 
-    return str(save_path) # Return final path as string
+    return str(final_output_path_to_return) # Return final path as string
 
 # --- END OF FILE infer.py ---
