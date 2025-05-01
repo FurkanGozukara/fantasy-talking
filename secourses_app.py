@@ -1125,10 +1125,10 @@ def handle_cancel():
 
 
 # --- Gradio UI Definition ---
-with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V13)", theme=gr.themes.Soft()) as demo: # Updated title
+with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V14)", theme=gr.themes.Soft()) as demo: # Updated title
     gr.Markdown(
         """
-    # FantasyTalking: Realistic Talking Portrait Generation SECourses App V13 - https://www.patreon.com/posts/127855145
+    # FantasyTalking: Realistic Talking Portrait Generation SECourses App V14 - https://www.patreon.com/posts/127855145
     Generate a talking head video from an image and audio, or process a batch of images. Supports multiple prompts per generation.
     [GitHub](https://github.com/Fantasy-AMAP/fantasy-talking) | [arXiv Paper](https://arxiv.org/abs/2504.04842)
     """
