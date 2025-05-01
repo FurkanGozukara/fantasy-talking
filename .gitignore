@@ -9,6 +9,7 @@ diffsynth/prompters/__pycache__/
 diffsynth/schedulers/__pycache__/
 diffsynth/vram_management/__pycache__/
 models/
+Practical-RIFE
 output/
 temp_audios
 venv/

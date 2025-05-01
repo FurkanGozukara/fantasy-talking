@@ -10,6 +10,7 @@ import pprint # For pretty printing dicts
 import traceback # For detailed error logging
 import shutil # <<< Added for file copying
 import re # <<< Added for regex in sequential naming
+import sys # <<< Added for sys.executable in RIFE call
 
 # import cv2 # No longer needed directly here
 import librosa # Keep for checking audio duration before processing
@@ -286,13 +287,19 @@ def main(
 
         # Extract other parameters
         num_frames = args['num_frames']
-        fps = args['fps']
+        fps = args['fps'] # This is the original FPS
         audio_path = args['audio_path']
         image_path = args['image_path']
         width = args['width']
         height = args['height']
         seed = args['seed']
         save_video_quality = args.get('save_video_quality', 18) # Use CRF, default 18
+
+        # <<< Extract RIFE parameters >>>
+        rife_mode = args.get('rife_mode', "None")
+        rife_max_fps = args.get('rife_max_fps', 30)
+        # Ensure original_fps is available if needed for RIFE calculations
+        original_fps = args.get('original_fps', fps) # Fallback to fps if not passed
 
         # <<< Use actual prompt passed for this specific run >>>
         current_prompt = args['prompt'] # This is the single line prompt for this run
@@ -479,6 +486,112 @@ def main(
         except OSError as e: print(f"{log_prefix} Warning: Could not remove temp file {save_path_tmp}: {e}")
     else: print(f"{log_prefix} Warning: Final output {save_path} not found after FFmpeg. Temp file {save_path_tmp} may be kept.")
 
+    # --- <<< RIFE Post-Processing (if enabled and FFmpeg successful) >>> ---
+    rife_applied = False
+    rife_output_path_final = None # Store the final RIFE path if successful
+    if save_path.exists() and rife_mode != "None":
+        print(f"{log_prefix} [RIFE] Starting RIFE post-processing ({rife_mode}) for: {save_path}")
+        rife_start_time = time.perf_counter()
+
+        base_video_path = Path(save_path) # Use the path from FFmpeg
+        rife_multiplier = 0
+        rife_suffix = ""
+        if rife_mode == "2x FPS":
+            rife_multiplier = 2
+            rife_suffix = "_RIFE_2x"
+        elif rife_mode == "4x FPS":
+            rife_multiplier = 4
+            rife_suffix = "_RIFE_4x"
+
+        if rife_multiplier > 0:
+            rife_output_name = f"{base_video_path.stem}{rife_suffix}{base_video_path.suffix}"
+            rife_output_path = base_video_path.parent / rife_output_name
+
+            # Calculate target FPS and check against limit
+            try:
+                # Use the original_fps extracted earlier
+                target_rife_fps = original_fps * rife_multiplier
+                print(f"{log_prefix} [RIFE] Original FPS: {original_fps}, Target RIFE FPS: {target_rife_fps}, Limit: {rife_max_fps}")
+
+                rife_fps_arg = None
+                if rife_max_fps and target_rife_fps > rife_max_fps:
+                    rife_fps_arg = int(rife_max_fps) # Limit the FPS
+                    print(f"{log_prefix} [RIFE] Target FPS ({target_rife_fps}) exceeds limit ({rife_max_fps}). Setting RIFE FPS to {rife_fps_arg}.")
+                else:
+                    print(f"{log_prefix} [RIFE] Target FPS ({target_rife_fps}) within limit. Using multiplier {rife_multiplier}x.")
+                    # No --fps needed, RIFE will use --multi
+
+                # Build the command
+                rife_script_path_relative = "Practical-RIFE/inference_video.py" # Relative path
+                # Ensure the script exists relative to the workspace root
+                rife_script_path_abs = Path(rife_script_path_relative).resolve()
+                rife_cwd = rife_script_path_abs.parent # CWD should be the directory containing the script
+
+                if not rife_script_path_abs.exists():
+                    raise FileNotFoundError(f"RIFE script not found at {rife_script_path_abs}")
+
+                cmd = [
+                    sys.executable, # Use the current Python interpreter
+                    str(rife_script_path_abs.name), # Just the script name
+                    "--video", str(base_video_path.resolve()),
+                    "--output", str(rife_output_path.resolve()),
+                    "--multi", str(rife_multiplier),
+                    "--ext", "mp4" # Force mp4 output
+                ]
+                if rife_fps_arg is not None:
+                    cmd.extend(["--fps", str(rife_fps_arg)])
+
+                print(f"{log_prefix} [RIFE] Running command in {rife_cwd}: {' '.join(cmd)}")
+                try:
+                    # Run RIFE process
+                    process = subprocess.run(cmd, check=True, capture_output=True, text=True, encoding='utf-8', cwd=str(rife_cwd))
+                    rife_duration = time.perf_counter() - rife_start_time
+                    print(f"{log_prefix} [RIFE] stdout:\n{process.stdout}") # Log RIFE stdout
+                    print(f"{log_prefix} [RIFE] stderr:\n{process.stderr}") # Log RIFE stderr
+                    print(f"{log_prefix} [RIFE] Processing finished successfully in {rife_duration:.2f}s.")
+
+                    # <<< IMPORTANT: Update save_path if RIFE succeeded >>>
+                    save_path = rife_output_path # Update to the RIFE output path
+                    rife_applied = True
+                    rife_output_path_final = rife_output_path # Store for metadata
+                    print(f"{log_prefix} [RIFE] Updated save_path to: {save_path}")
+
+                    # Optional: Delete the original non-RIFE file?
+                    # try:
+                    #     print(f"{log_prefix} [RIFE] Deleting original non-RIFE file: {base_video_path}")
+                    #     base_video_path.unlink()
+                    # except OSError as del_e:
+                    #     print(f"{log_prefix} [RIFE] Warning: Could not delete original file {base_video_path}: {del_e}")
+
+                except FileNotFoundError as fnf_e:
+                    # This could happen if sys.executable is wrong, or the script disappears between check and run
+                    print(f"{log_prefix} !!! Error [RIFE] Command failed (FileNotFoundError): {fnf_e}. Is Python path correct? Is script accessible? CWD: {rife_cwd}")
+                    # Keep original path, rife_applied = False
+                except subprocess.CalledProcessError as e:
+                    rife_duration = time.perf_counter() - rife_start_time
+                    print(f"{log_prefix} !!! Error [RIFE] Processing failed after {rife_duration:.2f}s. Exit code: {e.returncode}")
+                    print(f"{log_prefix} [RIFE] Command: {' '.join(e.cmd)}")
+                    print(f"{log_prefix} [RIFE] stdout:\n{e.stdout}")
+                    print(f"{log_prefix} [RIFE] stderr:\n{e.stderr}")
+                    # Keep original path, rife_applied = False
+                except Exception as e:
+                    rife_duration = time.perf_counter() - rife_start_time
+                    print(f"{log_prefix} !!! Error [RIFE] An unexpected error occurred during RIFE processing after {rife_duration:.2f}s: {e}")
+                    traceback.print_exc()
+                    # Keep original path, rife_applied = False
+
+            except FileNotFoundError as e:
+                # Error finding the script *before* running subprocess
+                 print(f"{log_prefix} !!! Error [RIFE] Setup failed: {e}. Skipping RIFE.")
+            except Exception as e:
+                print(f"{log_prefix} !!! Error [RIFE] Error preparing RIFE command or calculating FPS for {base_video_path.name}: {e}")
+                traceback.print_exc()
+                # Keep original path, rife_applied = False
+    elif not save_path.exists():
+        print(f"{log_prefix} Skipping RIFE because FFmpeg output {save_path.name} was not found.")
+    else: # rife_mode is None
+        print(f"{log_prefix} RIFE is disabled (mode={rife_mode}). Skipping RIFE post-processing.")
+    # --- End RIFE Post-Processing --- #
 
     # --- Metadata Saving Logic ---
     if save_metadata and metadata_path:
@@ -489,7 +602,7 @@ def main(
                 "generation_timestamp_utc": start_time_global.utcnow().isoformat() + "Z",
                 "generation_duration_seconds": round(generation_duration_perf, 3),
                 "generation_wall_time_seconds": round(generation_duration_wall.total_seconds(), 3),
-                "output_video_file": save_path.name,
+                "output_video_file": save_path.name, # <<< Will reflect RIFE output if applied
                 "output_metadata_file": metadata_path.name if metadata_path else "N/A",
                 "base_name_with_suffixes": base_name_with_suffixes, # <<< Use the name including suffixes
                 "input_image_file": Path(args['image_path']).name,
@@ -498,6 +611,9 @@ def main(
                 "variation_index": generation_index, # <<< Renamed for clarity
                 "total_variations_for_prompt": total_generations, # <<< Renamed for clarity
                 "prompt_index": prompt_index, # <<< Added prompt index (1-based or None)
+                "rife_applied": rife_applied, # <<< Added RIFE status
+                "rife_mode": rife_mode, # <<< Added RIFE mode used
+                "rife_output_file": rife_output_path_final.name if rife_output_path_final else "N/A", # <<< Added RIFE output name
                 "settings": {
                      "prompt": current_prompt, # <<< Save the specific prompt used
                      "negative_prompt": args['negative_prompt'],

@@ -179,6 +179,9 @@ def get_default_settings():
         # "batch_skip_existing_checkbox": True,
         # "batch_use_gradio_audio_checkbox": True,
         # "batch_use_gradio_prompt_checkbox": True,
+        # <<< RIFE Defaults >>>
+        "rife_mode_radio": "None",
+        "rife_max_fps_input": 30,
     }
 
 def create_default_preset_if_missing():
@@ -220,6 +223,8 @@ SETTING_COMPONENTS_VARS = [
     # Batch Tab (Add these if you want presets to save/load batch settings)
     # "batch_input_folder_input", "batch_output_folder_input",
     # "batch_skip_existing_checkbox", "batch_use_gradio_audio_checkbox", "batch_use_gradio_prompt_checkbox",
+    # <<< RIFE Settings >>>
+    "rife_mode_radio", "rife_max_fps_input",
 ]
 
 def save_preset(preset_name, *component_values):
@@ -292,12 +297,20 @@ def load_preset(preset_name):
                 if var_name == "enable_multi_line_prompts_checkbox" and var_name not in loaded_settings:
                     print(f"[Warning][Presets] Setting '{var_name}' not found in preset '{preset_name}'. Using default False.")
                     updates.append(gr.update(value=False)) # Default to False if missing
+                # <<< Handle new RIFE settings missing from old presets >>>
+                elif var_name == "rife_mode_radio" and var_name not in loaded_settings:
+                    print(f"[Warning][Presets] Setting '{var_name}' not found in preset '{preset_name}'. Using default 'None'.")
+                    updates.append(gr.update(value="None")) # Default to "None" if missing
+                elif var_name == "rife_max_fps_input" and var_name not in loaded_settings:
+                    print(f"[Warning][Presets] Setting '{var_name}' not found in preset '{preset_name}'. Using default 30.")
+                    updates.append(gr.update(value=30)) # Default to 30 if missing
                 else:
                     updates.append(gr.update(value=setting_value))
             else:
                 # If a setting from the current UI is missing in the preset file,
                 # don't update it (keep its current value), except for the new checkbox handled above.
-                if var_name != "enable_multi_line_prompts_checkbox": # Avoid double warning
+                # <<< Update check to include RIFE handled above >>>
+                if var_name not in ["enable_multi_line_prompts_checkbox", "rife_mode_radio", "rife_max_fps_input"]:
                      print(f"[Warning][Presets] Setting '{var_name}' not found in preset '{preset_name}'. Keeping current value.")
                 updates.append(gr.update()) # Send an empty update
 
@@ -468,6 +481,9 @@ def generate_video(
     tile_stride_w,
     vram_custom_value_input_param,
     torch_dtype_str,
+    # <<< RIFE Settings >>>
+    rife_mode,
+    rife_max_fps,
     progress=gr.Progress()
 ):
     """Handles the generation process for single image or multiple sequential generations."""
@@ -664,6 +680,11 @@ def generate_video(
                     "total_generations": num_generations, # Total variations for *this* prompt
                     "prompt_index": prompt_index_for_args, # <<< Pass prompt index (or None)
                     "output_base_name": sequential_base_name, # <<< Pass calculated base name (or None if single gen)
+                    # Add original FPS to args_dict for RIFE calculation later
+                    "original_fps": fps,
+                    # <<< Add RIFE settings >>>
+                    "rife_mode": rife_mode,
+                    "rife_max_fps": rife_max_fps,
                 }
 
                 # --- Execute Generation ---
@@ -700,7 +721,9 @@ def generate_video(
         else:
              print("[Generation] Generation loops exited due to cancellation.")
 
-        return output_video_path
+        is_generating = False; is_cancelling = False; cancel_requested = False # Reset all flags
+        print(f"[State Check] Exiting FINALLY block for generate_video. Flags after reset: is_generating={is_generating}, is_cancelling={is_cancelling}, cancel_requested={cancel_requested}")
+        # Optional: torch.cuda.empty_cache()
 
     except gr.Error as gr_e: print(f"[Gradio Error] {gr_e}"); return None
     except Exception as e: print(f"[Error] Unexpected error in generate_video: {e}"); traceback.print_exc(); gr.Error(f"Unexpected error: {e}"); return None
@@ -815,6 +838,9 @@ def process_batch(
     tile_stride_w,
     vram_custom_value_input_param,
     torch_dtype_str,
+    # <<< RIFE Settings >>>
+    rife_mode,
+    rife_max_fps,
     progress=gr.Progress()
 ):
     """Handles the batch processing of images from a folder."""
@@ -1028,6 +1054,11 @@ def process_batch(
                         "total_generations": num_variations_per_image, # Total variations for this prompt/image combo
                         "prompt_index": prompt_index_for_args,      # Prompt index for multi-line (1-based or None)
                         "output_base_name": image_stem,          # Base name for infer.py naming
+                        # Add original FPS to args_dict for RIFE calculation later
+                        "original_fps": fps,
+                        # <<< Add RIFE settings >>>
+                        "rife_mode": rife_mode,
+                        "rife_max_fps": rife_max_fps,
                     }
 
                     # --- Execute Generation ---
@@ -1070,6 +1101,9 @@ def process_batch(
         is_generating = False; is_cancelling = False; cancel_requested = False # Reset all flags
         print(f"[State Check] Exiting FINALLY block for process_batch. Flags after reset: is_generating={is_generating}, is_cancelling={is_cancelling}, cancel_requested={cancel_requested}")
 
+        is_generating = False; is_cancelling = False; cancel_requested = False # Reset all flags
+        print(f"[State Check] Exiting FINALLY block for process_batch. Flags after reset: is_generating={is_generating}, is_cancelling={is_cancelling}, cancel_requested={cancel_requested}")
+
 
 # --- Cancel Handler ---
 def handle_cancel():
@@ -1088,10 +1122,10 @@ def handle_cancel():
 
 
 # --- Gradio UI Definition ---
-with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V9.1)", theme=gr.themes.Soft()) as demo: # Updated title
+with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V11)", theme=gr.themes.Soft()) as demo: # Updated title
     gr.Markdown(
         """
-    # FantasyTalking: Realistic Talking Portrait Generation SECourses App V10 - Multi-Prompt Update
+    # FantasyTalking: Realistic Talking Portrait Generation SECourses App V11 - Multi-Prompt Update
     Generate a talking head video from an image and audio, or process a batch of images. Supports multiple prompts per generation.
     [GitHub](https://github.com/Fantasy-AMAP/fantasy-talking) | [arXiv Paper](https://arxiv.org/abs/2504.04842) | [Patreon Post](https://www.patreon.com/posts/127855145)
     """
@@ -1223,6 +1257,28 @@ with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V9.1)", the
                     preset_name_input = gr.Textbox(label="Save Preset As", placeholder="Enter preset name...")
                     save_preset_btn = gr.Button("Save Current Settings")
 
+            # --- RIFE Section (Added above Presets) ---
+            with gr.Accordion("3a. RIFE Frame Interpolation (Optional)", open=True):
+                gr.Markdown(
+                    """
+                    Apply RIFE AI (SOTA Frame Increase Model) frame interpolation to increase the video's FPS *after* generation.
+                    Output filename will have `_RIFE_2x` or `_RIFE_4x` appended.
+                    """
+                )
+                rife_mode_radio = gr.Radio(
+                    ["None", "2x FPS", "4x FPS"],
+                    value="None", # Default to None
+                    label="RIFE Mode",
+                    info="Select FPS multiplication factor. 'None' disables RIFE."
+                )
+                rife_max_fps_input = gr.Number(
+                    value=30, # Default limit
+                    label="Max RIFE FPS Limit",
+                    minimum=1,
+                    step=1,
+                    precision=0,
+                    info="Limit the final FPS after RIFE. E.g., 23fps * 2x = 46fps. If limit is 30, output will be 30fps."
+                )
     # --- Event Handling ---
 
     # Single Generation Button
@@ -1237,6 +1293,7 @@ with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V9.1)", the
             tiled_vae_checkbox, tile_size_h_input, tile_size_w_input, tile_stride_h_input, tile_stride_w_input,
             vram_custom_value_input,
             torch_dtype_dropdown,
+            rife_mode_radio, rife_max_fps_input,
         ]
     gen_event = process_btn.click(fn=generate_video, inputs=gen_inputs, outputs=video_output)
 
@@ -1255,6 +1312,7 @@ with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V9.1)", the
               tiled_vae_checkbox, tile_size_h_input, tile_size_w_input, tile_stride_h_input, tile_stride_w_input,
               vram_custom_value_input,
               torch_dtype_dropdown,
+              rife_mode_radio, rife_max_fps_input,
          ]
     batch_event = batch_start_btn.click(fn=process_batch, inputs=batch_inputs, outputs=video_output)
 
@@ -1271,6 +1329,8 @@ with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V9.1)", the
         sigma_shift, denoising_strength, save_video_quality, save_metadata_checkbox,
         vram_preset_dropdown, vram_custom_value_input,
         tile_size_h_input, tile_size_w_input, tile_stride_h_input, tile_stride_w_input,
+        # <<< RIFE Settings >>>
+        rife_mode_radio, rife_max_fps_input,
     ]
 
     # --- Preset Event Handling ---
