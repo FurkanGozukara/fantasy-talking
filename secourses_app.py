@@ -1068,7 +1068,7 @@ with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V1)", theme
 
             with gr.Row():
                 seed_input = gr.Number(value=DEFAULT_SEED, label="Seed", minimum=-1, precision=0, info="-1 for default")
-                random_seed_checkbox = gr.Checkbox(label="Use Random Seed", value=True, info="Overrides Seed if checked.")
+                random_seed_checkbox = gr.Checkbox(label="Use Random Seed", value=False, info="Overrides Seed if checked.")
 
             with gr.Accordion("Advanced Settings", open=True):
                 with gr.Row():
