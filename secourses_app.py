@@ -882,6 +882,7 @@ def process_batch(
     height,
     duration_seconds,
     fps,
+    num_generations_input, # <<< Added: Get number of variations per image
     # CFG & Weights
     prompt_cfg_scale,
     audio_cfg_scale,
@@ -980,6 +981,17 @@ def process_batch(
         try: initial_seed = int(seed); initial_seed = max(0, initial_seed)
         except: initial_seed = DEFAULT_SEED; gr.Warning(f"[Batch] Invalid seed, using default")
 
+        # <<< Added: Validate num_generations_input for batch >>>
+        try:
+             num_variations_per_image = int(num_generations_input)
+             if num_variations_per_image < 1:
+                  gr.Warning("[Batch] Number of Generations must be at least 1. Setting to 1.")
+                  num_variations_per_image = 1
+        except (ValueError, TypeError):
+             gr.Warning("[Batch] Invalid Number of Generations input. Setting to 1 variation per image.")
+             num_variations_per_image = 1
+        print(f"[Batch Config] Generating {num_variations_per_image} variation(s) per image.")
+        # <<< End Added >>>
 
         # --- Model Loading / Reloading Check (same as single generation) ---
         progress(0.1, desc="Checking model status...")
@@ -1009,37 +1021,23 @@ def process_batch(
         print(f"[Batch] Starting batch processing loop for {total_files} image(s)...")
         cancel_fn = lambda: cancel_requested # Define cancel function
 
-        for i, image_path in enumerate(image_files):
-            current_batch_index = i + 1
-            progress_desc = f"Batch {current_batch_index}/{total_files}: {image_path.name}"
-            progress((i / total_files) * 0.8 + 0.15, desc=progress_desc) # Scale progress: 0.15 to 0.95
+        total_iterations = total_files * num_variations_per_image # <<< Updated total iterations for progress
+        current_iteration = 0
 
-            # --- Cancellation Check ---
+        for i, image_path in enumerate(image_files):
+            # --- Outer loop iterates through image files --- #
+            image_stem = image_path.stem
+            print(f"\n--- Processing Batch Item {i + 1}/{total_files}: {image_path.name} ---")
+
+            # --- Check cancellation before processing variations for this image --- #
             if cancel_requested:
-                print(f"[Cancellation][Batch] Cancellation detected before processing item {current_batch_index}.")
+                print(f"[Cancellation][Batch] Cancellation detected before processing item {i + 1}.")
                 gr.Warning("Batch processing cancelled by user.")
                 break
 
-            print(f"\n--- Processing Batch Item {current_batch_index}/{total_files}: {image_path.name} ---")
-            image_stem = image_path.stem
-            output_video_path = batch_output_folder / f"{image_stem}.mp4"
-            output_metadata_path = batch_output_folder / f"{image_stem}.txt"
-
-            # --- Skip Logic ---
-            if batch_skip_existing:
-                video_exists = output_video_path.exists()
-                metadata_exists = save_metadata and output_metadata_path.exists()
-                if video_exists or metadata_exists:
-                    reason = []
-                    if video_exists: reason.append("video exists")
-                    if metadata_exists: reason.append("metadata exists")
-                    print(f"[Skip][Batch] Skipping '{image_path.name}' because {' and '.join(reason)}.")
-                    skipped_files_count += 1
-                    continue # Skip to the next file
-
-            # --- Find Corresponding Audio ---
+            # --- Find Corresponding Audio (Done once per image file) --- #
             audio_file_to_use = None
-            audio_extensions = {".wav", ".mp3", ".flac"} # Add more if needed
+            audio_extensions = {".wav", ".mp3", ".flac"}
             found_audio = False
             for ext in audio_extensions:
                  potential_audio_path = batch_input_folder / f"{image_stem}{ext}"
@@ -1056,9 +1054,11 @@ def process_batch(
                       print(f"[Error][Batch] No matching audio found for '{image_stem}' and UI fallback disabled or missing. Skipping.")
                       gr.Warning(f"Skipping {image_path.name}: No matching audio found.")
                       error_files_count += 1
-                      continue # Skip this image
+                      skipped_files_count += num_variations_per_image # <<< Skip all variations for this image
+                      current_iteration += num_variations_per_image # <<< Update progress iteration count
+                      continue # Skip this image entirely
 
-            # --- Find Corresponding Prompt ---
+            # --- Find Corresponding Prompt (Done once per image file) --- #
             prompt_to_use = prompt_fallback if prompt_fallback else DEFAULT_PROMPT # Default
             prompt_source = "UI fallback or default"
             potential_prompt_path = batch_input_folder / f"{image_stem}.txt"
@@ -1078,7 +1078,7 @@ def process_batch(
             print(f"[Prompt Info][Batch] Using prompt from: {prompt_source}")
 
 
-            # --- Calculate Duration & Frames for this item ---
+            # --- Calculate Duration & Frames for this item (Done once per image file) --- #
             current_target_duration = duration_seconds
             try:
                 item_audio_duration = librosa.get_duration(filename=audio_file_to_use)
@@ -1092,6 +1092,8 @@ def process_batch(
                  print(f"[Error][Batch] Failed to get duration for audio '{Path(audio_file_to_use).name}'. Skipping item '{image_stem}'. Error: {e}")
                  gr.Warning(f"Skipping {image_path.name}: Error reading audio duration.")
                  error_files_count += 1
+                 skipped_files_count += num_variations_per_image # <<< Skip all variations
+                 current_iteration += num_variations_per_image # <<< Update progress iteration count
                  continue
 
             current_num_frames = calculate_frames(current_target_duration, fps)
@@ -1100,77 +1102,118 @@ def process_batch(
                  print(f"[Error][Batch] Calculated frames for '{image_stem}' is {current_num_frames}. Too low. Skipping.")
                  gr.Warning(f"Skipping {image_path.name}: Calculated frames too low ({current_num_frames}).")
                  error_files_count += 1
+                 skipped_files_count += num_variations_per_image # <<< Skip all variations
+                 current_iteration += num_variations_per_image # <<< Update progress iteration count
                  continue
 
+            # --- Inner loop for variations per image --- #
+            for j in range(num_variations_per_image):
+                variation_index = j + 1
+                current_iteration += 1 # <<< Increment overall progress iteration count
 
-            # --- Determine Seed ---
-            current_seed = 0
-            if use_random_seed:
-                current_seed = random.randint(0, 2**32 - 1)
-            else:
-                current_seed = initial_seed + i # Increment seed based on position in *found* image list
+                # --- Update Progress Description --- #
+                progress_desc = f"Image {i+1}/{total_files} ({image_path.name}), Variation {variation_index}/{num_variations_per_image}"
+                progress((current_iteration / total_iterations) * 0.8 + 0.15, desc=progress_desc) # Scale progress: 0.15 to 0.95
 
-            print(f"[Seed Info][Batch] Item '{image_stem}' using seed: {current_seed}")
+                # --- Cancellation Check (inside inner loop) --- #
+                if cancel_requested:
+                    print(f"[Cancellation][Batch] Cancellation detected during variation {variation_index} for item {i+1}.")
+                    gr.Warning("Batch processing cancelled by user.")
+                    # Set a flag to break outer loop after inner loop finishes
+                    cancel_requested = True # Ensure outer loop breaks too
+                    break # Break inner variation loop
 
-            # --- Prepare Arguments for infer.main ---
-            print(f"[Args Prep][Batch] Preparing arguments for item '{image_stem}'...")
-            args_dict = {
-                "image_path": image_path.resolve().as_posix(),
-                "audio_path": audio_file_to_use, # Already resolved path
-                "prompt": prompt_to_use,
-                "negative_prompt": negative_prompt,
-                "output_dir": str(batch_output_folder), # Use batch output dir
-                "width": width,
-                "height": height,
-                "num_frames": current_num_frames, # Use item-specific frame count
-                "fps": fps,
-                "audio_weight": float(audio_weight),
-                "prompt_cfg_scale": float(prompt_cfg_scale),
-                "audio_cfg_scale": float(audio_cfg_scale),
-                "inference_steps": int(inference_steps),
-                "seed": current_seed,
-                "tiled_vae": bool(tiled_vae),
-                "tile_size_h": int(tile_size_h), "tile_size_w": int(tile_size_w),
-                "tile_stride_h": int(tile_stride_h), "tile_stride_w": int(tile_stride_w),
-                "sigma_shift": float(sigma_shift),
-                "denoising_strength": float(denoising_strength),
-                "save_video_quality": int(save_video_quality),
-                "save_metadata": bool(save_metadata),
-                # Control info for logging/naming
-                "generation_index": current_batch_index,
-                "total_generations": total_files,
-                "output_base_name": image_stem, # *** Use image stem for naming ***
-            }
+                # --- Skip Logic (Check specific output for this variation) --- #
+                output_video_suffix = f"_{variation_index:04d}" if num_variations_per_image > 1 else ""
+                output_video_path = batch_output_folder / f"{image_stem}{output_video_suffix}.mp4"
+                output_metadata_path = batch_output_folder / f"{image_stem}{output_video_suffix}.txt"
 
-            # --- Execute Generation for Batch Item ---
-            try:
-                # Add logging for the output directory being passed
-                print(f"[Execution][Batch] Calling infer.main for '{image_stem}' with output_dir: '{args_dict['output_dir']}'")
-                # *** Pass cancel_fn and gradio_progress to main ***
-                last_output_path = main(
-                    args_dict, pipe, fantasytalking, wav2vec_processor, wav2vec,
-                    cancel_fn=cancel_fn,
-                    gradio_progress=progress
-                )
-                print(f"[Execution][Batch] Successfully processed item '{image_stem}'. Output: {last_output_path}")
-                processed_files_count += 1
-            except CancelledError as ce:
-                print(f"[Cancellation][Batch] Caught CancelledError during item '{image_stem}': {ce}")
-                gr.Warning(f"Batch processing cancelled by user during item {current_batch_index}.")
-                # Attempt model unload in finally block
-                break # Stop the batch loop
-            except Exception as e:
-                print(f"[Error][Batch] Failed to process item '{image_stem}'. Error: {str(e)}")
-                traceback.print_exc()
-                gr.Warning(f"Error processing {image_path.name}: {e}. Skipping.")
-                error_files_count += 1
-                # Clear cache potentially? Optional.
-                # torch.cuda.empty_cache()
-                continue # Continue to the next item in the batch
+                if batch_skip_existing:
+                    video_exists = output_video_path.exists()
+                    metadata_exists = save_metadata and output_metadata_path.exists()
+                    if video_exists or metadata_exists:
+                        reason = []
+                        if video_exists: reason.append("video exists")
+                        if metadata_exists: reason.append("metadata exists")
+                        print(f"[Skip][Batch] Skipping variation {variation_index} for '{image_path.name}' because {' and '.join(reason)}.")
+                        skipped_files_count += 1
+                        continue # Skip to the next variation
 
-        # --- Batch Loop Finished ---
+                # --- Determine Seed for this specific variation --- #
+                current_seed = 0
+                if use_random_seed:
+                    current_seed = random.randint(0, 2**32 - 1)
+                else:
+                    # Make seed unique based on image index AND variation index
+                    current_seed = initial_seed + i * num_variations_per_image + j
+
+                print(f"[Seed Info][Batch] Variation {variation_index} for '{image_stem}' using seed: {current_seed}")
+
+                # --- Prepare Arguments for infer.main --- #
+                print(f"[Args Prep][Batch] Preparing arguments for variation {variation_index} of item '{image_stem}'...")
+                args_dict = {
+                    "image_path": image_path.resolve().as_posix(),
+                    "audio_path": audio_file_to_use, # Already resolved path
+                    "prompt": prompt_to_use,
+                    "negative_prompt": negative_prompt,
+                    "output_dir": str(batch_output_folder), # Use batch output dir
+                    "width": width,
+                    "height": height,
+                    "num_frames": current_num_frames, # Use item-specific frame count
+                    "fps": fps,
+                    "audio_weight": float(audio_weight),
+                    "prompt_cfg_scale": float(prompt_cfg_scale),
+                    "audio_cfg_scale": float(audio_cfg_scale),
+                    "inference_steps": int(inference_steps),
+                    "seed": current_seed,
+                    "tiled_vae": bool(tiled_vae),
+                    "tile_size_h": int(tile_size_h), "tile_size_w": int(tile_size_w),
+                    "tile_stride_h": int(tile_stride_h), "tile_stride_w": int(tile_stride_w),
+                    "sigma_shift": float(sigma_shift),
+                    "denoising_strength": float(denoising_strength),
+                    "save_video_quality": int(save_video_quality),
+                    "save_metadata": bool(save_metadata),
+                    # --- Crucial change: Pass variation index and total variations --- #
+                    "generation_index": variation_index, # <<< Index of the current variation (1, 2, ...)
+                    "total_generations": num_variations_per_image, # <<< Total variations requested for this image
+                    # -------------------------------------------------------------- #
+                    "output_base_name": image_stem, # Pass image stem for infer.py to handle suffixing
+                }
+
+                # --- Execute Generation for Batch Item Variation --- #
+                try:
+                    print(f"[Execution][Batch] Calling infer.main for variation {variation_index} of '{image_stem}' with output_dir: '{args_dict['output_dir']}'")
+                    last_output_path = main(
+                        args_dict, pipe, fantasytalking, wav2vec_processor, wav2vec,
+                        cancel_fn=cancel_fn,
+                        gradio_progress=progress
+                    )
+                    print(f"[Execution][Batch] Successfully processed variation {variation_index} for '{image_stem}'. Output: {last_output_path}")
+                    processed_files_count += 1
+                except CancelledError as ce:
+                    print(f"[Cancellation][Batch] Caught CancelledError during variation {variation_index} for '{image_stem}': {ce}")
+                    gr.Warning(f"Batch processing cancelled by user during variation {variation_index} of image {i+1}.")
+                    cancel_requested = True # Ensure outer loop breaks
+                    break # Stop processing variations for this image
+                except Exception as e:
+                    print(f"[Error][Batch] Failed to process variation {variation_index} for '{image_stem}'. Error: {str(e)}")
+                    traceback.print_exc()
+                    gr.Warning(f"Error processing variation {variation_index} of {image_path.name}: {e}. Skipping.")
+                    error_files_count += 1
+                    # Clear cache potentially? Optional.
+                    # torch.cuda.empty_cache()
+                    continue # Continue to the next variation for this image
+
+            # --- End of inner loop (variations) --- #
+            # If cancellation happened inside inner loop, break outer loop now
+            if cancel_requested:
+                break
+        # --- End of outer loop (image files) --- #
+
+        # --- Batch Loop Finished --- #
         if not cancel_requested:
              final_desc = f"Batch complete! Processed: {processed_files_count}, Skipped: {skipped_files_count}, Errors: {error_files_count}."
+             # Ensure progress bar reaches 100% even if counts are off due to skipping
              progress(1.0, desc=final_desc)
              print(f"[Batch] Batch processing finished. Processed: {processed_files_count}, Skipped: {skipped_files_count}, Errors: {error_files_count}.")
              gr.Info(final_desc)
@@ -1232,7 +1275,7 @@ def handle_cancel():
 with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V1)", theme=gr.themes.Soft()) as demo:
     gr.Markdown(
         """
-    # FantasyTalking: Realistic Talking Portrait Generation SECourses App V7 - https://www.patreon.com/posts/127855145
+    # FantasyTalking: Realistic Talking Portrait Generation SECourses App V8 - https://www.patreon.com/posts/127855145
     Generate a talking head video from an image and audio, or process a batch of images.
     [GitHub](https://github.com/Fantasy-AMAP/fantasy-talking) | [arXiv Paper](https://arxiv.org/abs/2504.04842)
     """
@@ -1285,7 +1328,7 @@ with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V1)", theme
                 duration_input = gr.Number(value=DEFAULT_DURATION, minimum=1, maximum=MAX_DURATION, label="Max Duration (s)", info=f"Video length (capped by audio, max {MAX_DURATION}s)")
                 fps_input = gr.Number(value=DEFAULT_FPS, minimum=1, maximum=60, label="FPS", precision=0)
 
-            num_generations_input = gr.Number(label="Number of Generations (Single Mode)", value=1, minimum=1, step=1, precision=0, info="Generate multiple sequential videos with varying seeds.")
+            num_generations_input = gr.Number(label="Number of Generations (Both Single and Batch Gens)", value=1, minimum=1, step=1, precision=0, info="Generate multiple sequential videos with varying seeds.")
 
             with gr.Row():
                 prompt_cfg_scale = gr.Slider(minimum=1.0, maximum=15.0, value=DEFAULT_PROMPT_CFG, step=0.5, label="Prompt CFG")
@@ -1411,6 +1454,7 @@ with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V1)", theme
               # Fallbacks / General Settings from UI
               image_input, audio_input, prompt_input, negative_prompt_input,
               width_input, height_input, duration_input, fps_input,
+              num_generations_input, # <<< Added: Get number of variations per image
               prompt_cfg_scale, audio_cfg_scale, audio_weight,
               inference_steps, seed_input, random_seed_checkbox,
               sigma_shift, denoising_strength, save_video_quality, save_metadata_checkbox,
