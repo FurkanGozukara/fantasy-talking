@@ -1017,7 +1017,7 @@ with gr.Blocks(title="FantasyTalking Video Generation (SECourses App V1)", theme
             video_audio_input = gr.File(
                 label="Or Upload Video to Extract Audio",
                 file_types=["video", ".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv"],
-                type="filepath"
+                type="filepath",height=150
             )
 
             prompt_input = gr.Textbox(
