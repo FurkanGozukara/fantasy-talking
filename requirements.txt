@@ -11,3 +11,4 @@ protobuf
 modelscope
 ftfy
 librosa
+pydantic==2.10.6
