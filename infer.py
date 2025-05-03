@@ -117,7 +117,7 @@ def load_models(
         # <<< Simplified pipeline creation, dtype handled by from_model_manager logic internally now >>>
         # (Assuming diffsynth >= 0.0.17 where device/dtype handled more directly)
         pipe = WanVideoPipeline.from_model_manager(
-            model_manager, torch_dtype=target_pipeline_dtype, device=device
+            model_manager, torch_dtype=torch.bfloat16, device=device
         )
     except Exception as e:
         print(f"[Error][Model Loading] Failed to create WanVideoPipeline.")
